@@ -22,7 +22,7 @@ APP = 'VK Archive Enrich'
 REPO = 'https://github.com/optozorax/vk-archive-enrich'
 SECTIONS = [('messages', 'Сообщения'), ('wall', 'Стена'), ('comments', 'Ваши комментарии'),
             ('albums', 'Фотоальбомы'), ('docs', 'Документы'), ('profile', 'Подарки и истории'),
-            ('likes', 'Лайки (гигабайты)')]
+            ('support', 'Обращения в поддержку'), ('likes', 'Лайки (гигабайты)')]
 MEDIA = [('photos', 'Фото'), ('videos', 'Видео'), ('covers', 'Обложки видео'), ('voice', 'Голосовые'),
          ('music', 'Музыка'), ('docs', 'Документы'), ('stickers', 'Стикеры'), ('gifts', 'Подарки'),
          ('avatars', 'Аватарки')]
@@ -177,7 +177,7 @@ class App:
         self.btn_start.pack(side='left')
         self.btn_stop = ttk.Button(bar, text='Стоп', command=self.stop, state='disabled')
         self.btn_stop.pack(side='left', padx=6)
-        self.btn_open = ttk.Button(bar, text='Открыть результат', command=self.open_result)
+        self.btn_open = ttk.Button(bar, text='Открыть результат', width=19, command=self.open_result)
         self.btn_open.pack(side='left')
         ttk.Button(bar, text='Папка', command=self.open_folder).pack(side='left', padx=6)
         ttk.Button(bar, text='Справка', command=lambda: webbrowser.open(REPO + '#readme')).pack(side='right')
@@ -389,6 +389,24 @@ class App:
             self.determinate(0)
             self.status.set('Остановлено (код %s). Запустите снова — скачанное сохранится, работа продолжится.' % code)
 
+    def demo(self):
+        """Example state for screenshots: invented paths and a log like a real run."""
+        self.src.set(r'D:\Архив ВК')
+        self.dst.set(r'D:\Архив ВК_enriched')
+        self.sections['likes'].set(True)
+        for line in ['18:02:11 Using the vk.ru session from Firefox',
+                     '18:02:12 Logged in as id100000000',
+                     '18:02:24 Archive: 27 conversations, 48 213 messages (read in 11s)',
+                     '18:02:25 Messages: fetching attachments of 27 conversations',
+                     '18:03:40 [12/27] peer 100000014: 1840/1840 messages from API, 2177 new files queued',
+                     '18:04:10    downloads: 3120/6230 done (3109 ok), 3110 in queue',
+                     '18:04:40    downloads: 3966/6230 done (3951 ok), 2264 in queue']:
+            self.append(line + '\n')
+        self.btn_start.configure(state='disabled')
+        self.btn_stop.configure(state='normal')
+        self.determinate(63.7)
+        self.status.set('Файлы: 3 966 из 6 230')
+
     def on_finished(self, code):  # replaced by the build self-test
         pass
 
@@ -462,6 +480,9 @@ def main():
     if os.environ.get('VK_ARCHIVE_ENRICH_SELFTEST'):  # the window opens and closes
         app.save_settings = lambda: None
         root.after(int(os.environ['VK_ARCHIVE_ENRICH_SELFTEST']), root.destroy)
+    if os.environ.get('VK_ARCHIVE_ENRICH_DEMO'):  # a filled-in window in mid-work, for the README screenshot
+        app.save_settings = lambda: None
+        app.demo()
     if os.environ.get('VK_ARCHIVE_ENRICH_SELFTEST_ARCHIVE'):  # a whole offline run through the window
         app.save_settings = lambda: None
         app.src.set(os.environ['VK_ARCHIVE_ENRICH_SELFTEST_ARCHIVE'])

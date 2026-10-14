@@ -251,7 +251,6 @@
     var HEAT = ['#ebedf0', '#b7d3f6', '#6da7ec', '#2a78d6', '#184f95'];
     var MSHORT = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
     var WD = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'];
-    var LABEL = {sent: 'Отправлено', recv: 'Получено', all: 'Всего сообщений'};
     var mode = store('exStatsMode') || 'sent';
     var cb = $('#ex-nogroups');
     var noGroups = cb ? store('exStatsNoGroups') !== '0' : false;
@@ -327,10 +326,13 @@
       });
       var bestHtml = best ? (ST.links && ST.links[best] ? '<a href="' + escapeHtml(ST.links[best]) + '">' + keyDate(best) + '</a>' : keyDate(best)) +
                             ' · ' + fnum(bestV) : '—';
-      var tiles = [[LABEL[mode], fnum(pick([sent, recv]))], ['Отправлено', fnum(sent)], ['Получено', fnum(recv)],
-                   ['Дней с сообщениями', fnum(active)], ['Самый активный день', bestHtml]];
+      // sent / received / total always shown; the one the switch selects is highlighted
+      var tiles = [['Отправлено', fnum(sent), mode === 'sent'], ['Получено', fnum(recv), mode === 'recv'],
+                   ['Всего', fnum(sent + recv), mode === 'all'], ['Дней с сообщениями', fnum(active)],
+                   ['Самый активный день', bestHtml]];
       $('#ex-st-tiles').innerHTML = tiles.map(function (t) {
-        return '<div class="ex-tile"><div class="ex-dim">' + t[0] + '</div><div class="ex-tile-v">' + t[1] + '</div></div>';
+        return '<div class="ex-tile' + (t[2] ? ' ex-tile-on' : '') + '"><div class="ex-dim">' + t[0] +
+               '</div><div class="ex-tile-v">' + t[1] + '</div></div>';
       }).join('');
       $('#ex-st-heat').innerHTML = heatmap();
       var ys = Object.keys(byYear).sort();

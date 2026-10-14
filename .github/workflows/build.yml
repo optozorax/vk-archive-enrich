@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests==2.34.2 pyflakes==3.4.0
-      - run: python -m pyflakes vk_archive_enrich.py vk_archive_enrich_gui.py tests/smoke_test.py
+      - run: python -m pyflakes vk_archive_enrich.py vk_archive_enrich_gui.py tests/smoke_test.py tools/
       - run: python tests/smoke_test.py
 
   windows:

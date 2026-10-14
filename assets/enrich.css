@@ -175,3 +175,13 @@ a.ex-card:hover{text-decoration:none;background:#f2f5f8}
 .ex-seg button+button{border-left:1px solid #d3d9de}
 .ex-seg button.ex-on{background:#5181b8;color:#fff}
 .ex-check{font-size:13px;color:#55677d;cursor:pointer;display:inline-flex;align-items:center;gap:5px}
+
+/* ---- support requests ---- */
+.ex-ticket-head{padding:12px 0;border-bottom:1px solid #e7e8ec;margin-bottom:6px}
+.ex-ticket-reply{display:flex;gap:10px;padding:12px 0;border-bottom:1px solid #f0f2f5}
+.ex-ticket-reply .ex-ava{margin:0;width:40px;height:40px}
+.ex-ticket-body{flex:1;min-width:0}
+.ex-ticket-reply.ex-mine .ex-ticket-body{background:#f2f6fa;border-radius:10px;padding:8px 10px}
+.ex-ticket-field{margin-top:6px;font-size:13px}
+.ex-ticket-body .ex-gallery{margin-top:6px}
+.ex-tile-on{background:#e8f0fa;box-shadow:inset 0 0 0 1px #9db7d6}

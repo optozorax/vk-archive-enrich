@@ -42,7 +42,7 @@ try:
 except ImportError:
     sys.exit('This script needs the "requests" package: pip install requests')
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 API_VERSION = '5.199'
 WEB_APP_ID = '6287487'  # app id of the vk.ru web client; its token can read messages
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'
@@ -696,9 +696,12 @@ class Media:
                     if r.status_code == 200 and ctype.startswith('text/html') and \
                             not r.url.lower().split('?')[0].endswith(('.html', '.htm')):
                         # pdf / djvu / torrent documents open VK's viewer page; it links the real file
-                        m = re.search(r'href="(https://[^"]*(?:vkuserphoto\.ru|userapi\.com)/[^"]+)"', r.text) if follow_page else None
-                        if m:
-                            return self._http(html.unescape(m.group(1)), tmp, limit, follow_page=False)
+                        if follow_page:  # as a plain link, or JSON-escaped inside the viewer's script
+                            m = re.search(r'href="(https://[^"]*(?:vkuserphoto\.ru|userapi\.com)/[^"]+)"', r.text) or \
+                                re.search(r'(https:\\/\\/[^"\'\s]*(?:vkuserphoto\.ru|userapi\.com)\\/[^"\'\s]+)', r.text)
+                            if m:
+                                real = html.unescape(m.group(1).replace('\\/', '/'))
+                                return self._http(real, tmp, limit, follow_page=False)
                         box = re.search(r'class="message_page_body">(.*?)</div>', r.text, re.S)
                         if box:  # e.g. uploader banned, removed on copyright request
                             text = html.unescape(re.sub(r'<[^>]+>', ' ', box.group(1)))
@@ -1542,7 +1545,7 @@ def peer_kind(peer):
 # the enrichment run
 # ----------------------------------------------------------------------------
 
-SECTIONS = ('messages', 'wall', 'comments', 'albums', 'docs', 'profile', 'likes')
+SECTIONS = ('messages', 'wall', 'comments', 'albums', 'docs', 'profile', 'support', 'likes')
 LIKE_KINDS = ('photo', 'wall', 'video', 'wall_reply', 'photo_comment', 'video_comment', 'topic_comment', 'market')
 LIKE_LINK = {  # how each likes/<kind> page links its objects; the match is the storage key
     'photo': r'vk\.(?:ru|com)/photo(-?\d+_\d+)"',
@@ -1555,6 +1558,66 @@ LIKE_LINK = {  # how each likes/<kind> page links its objects; the match is the 
     'market': r'vk\.(?:ru|com)/market\?w=product(-?\d+_\d+)"',
 }
 HERE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))  # where assets/ lives
+
+
+def clean_html(fragment):
+    """VK's own markup of a support reply reduced to text, line breaks, bold and links."""
+    t = re.sub(r'<img[^>]*\balt="([^"]*)"[^>]*>', r'\1', fragment or '')  # emoji images -> their character
+
+    def link(m):
+        href = html.unescape(m.group(1))
+        away = re.search(r'away\.php\?to=([^&]+)', href)
+        href = urllib.parse.unquote(away.group(1)) if away else urllib.parse.urljoin(VK + '/', href)
+        return '<a href="%s" target="_blank" rel="noopener">%s</a>' % (esc(href), re.sub(r'<[^>]+>', '', m.group(2)))
+    t = re.sub(r'<a\b[^>]*?href="([^"]*)"[^>]*>(.*?)</a>', link, t, flags=re.S)
+    t = re.sub(r'<(?!/?(?:a|b|br)\b)[^>]+>', '', t)  # every other tag goes
+    return re.sub(r'<br\s*/?>', '<br>', t).strip()
+
+
+def inner_div(page, cls, start=0):
+    """Inner html of the first <div class="cls..."> in page[start:]."""
+    k = page.find('class="%s' % cls, start)
+    if k < 0:
+        return ''
+    a = page.rfind('<div', 0, k)
+    b = div_end(page, a)
+    return page[page.find('>', k) + 1:b - 6]
+
+
+def parse_ticket(page):
+    """A support ticket page (vk.ru/support?act=show) -> dict, or None when VK shows no ticket."""
+    rows_at = page.find('id="tickets_reply_rows"')
+    if rows_at < 0:
+        return None
+    status = re.search(r'id="helpdesk_ticket_status"[^>]*>(.*?)</span>', page, re.S)
+    a = page.rfind('<div', 0, rows_at)
+    rows = page[a:div_end(page, a)]
+    replies = []
+    for x, y in div_blocks(rows, '<div class="tickets_reply_row'):
+        row = rows[x:y]
+        avatar = re.search(r'class="tickets_image".*?<img[^>]*src="([^"]+)"', row, re.S)
+        author = re.search(r'<span class="tickets_author">(.*?)</span>', row, re.S)
+        attachments = [{'href': urllib.parse.urljoin(VK + '/', html.unescape(h)), 'thumb': html.unescape(img),
+                        'name': html_text(name)}
+                       for h, img, name in re.findall(r'<a href="([^"]+)"[^>]*class="tr_attach">.*?<img[^>]*src="([^"]+)"'
+                                                      r'.*?(?:class="tr_doc_photo_hint">(.*?)</div>)?\s*</a>', row, re.S)]
+        fields = []
+        for fx, fy in div_blocks(row, '<div class="tickets_extra_field clear_fix'):
+            f = row[fx:fy]
+            label = re.search(r'tickets_extra_field__label">(.*?)</span>', f, re.S)
+            images = [{'href': html.unescape(h), 'thumb': html.unescape(i)} for h, i in re.findall(
+                r'<a href="([^"]+)"[^>]*>\s*<img class="tickets_extra_field__img" src="([^"]+)"', f)]
+            value = f[f.find('</span>') + 7:] if label else f
+            value = re.sub(r'<a href="[^"]+"[^>]*>\s*<img[^>]*>\s*</a>', '', value)
+            fields.append({'label': html_text(label.group(1)) if label else '', 'value': clean_html(value), 'images': images})
+        text = inner_div(row, 'tickets_reply_text').split('<div class="tickets_extra_fields')[0]
+        replies.append({'author': html_text(author.group(1)) if author else '',
+                        'mine': bool(author and 'href=' in author.group(1)),  # the ticket's author links to a profile
+                        'avatar': urllib.parse.urljoin(VK + '/', html.unescape(avatar.group(1))) if avatar else '',
+                        'date': html_text(inner_div(row, 'tickets_reply_actions__date')),
+                        'text': clean_html(text), 'attachments': attachments, 'fields': fields})
+    return {'title': html_text(inner_div(page, 'tickets_header_title')), 'status': html_text(status.group(1)) if status else '',
+            'replies': replies, 'fetched': int(time.time())}
 
 
 def like_key(m):
@@ -1585,6 +1648,7 @@ class Enricher:
         self.tz_votes = Counter()
         self.archive_names = self.src.peer_names()
         self.wall, self.my_comments, self.photos, self.docs, self.stories = {'posts': {}, 'comments': {}}, {}, {}, {}, {}
+        self.support = {}
         self.likes = {k: {} for k in LIKE_KINDS}
         self._counts = {}
 
@@ -1852,6 +1916,47 @@ class Enricher:
         for rel in self.src.series('likes/%s/likes0.html' % kind) if self.src.exists('likes/%s/likes0.html' % kind) else []:
             out += [m for m in rx.finditer(read_page(self.src.path(rel)))]
         return out
+
+    def do_support(self):
+        """Support requests: the export lists only their titles; the conversations live on vk.ru pages."""
+        path = self.data('support.json')
+        self.support = load_json(path, {})
+        rel = 'other/support.html'
+        if not self.online('support') or not self.src.exists(rel):
+            return
+        if not self.cookies:
+            log('Support requests: skipped, they need a browser session (cookies), not a token')
+            return
+        ids = re.findall(r'support\?act=show&(?:amp;)?id=(\d+)', read_page(self.src.path(rel)))
+        log('Support requests: %d' % len(ids))
+        os.makedirs(self.data('support'), exist_ok=True)
+        for tid in ids:
+            try:
+                page = self.api.http.get('%s/support?act=show&id=%s' % (VK, tid), timeout=60).text
+            except requests.RequestException as e:
+                log('   support request %s: %s' % (tid, type(e).__name__))
+                continue
+            ticket = parse_ticket(page)
+            if ticket is None:  # deleted or no longer shown: keep what an earlier run saved
+                self.support.setdefault(tid, {'missing': True})
+                continue
+            a = page.rfind('<div', 0, page.find('tickets_header clear_fix'))
+            with open(self.data('support', '%s.html' % tid), 'w', encoding='utf-8') as f:  # VK's own markup, for the record
+                f.write(page[a:page.find('tickets_post_field_wrap', a)])
+            self.support[tid] = ticket
+            time.sleep(0.4)
+        save_json(path, self.support)
+        for t in self.support.values():
+            for r in t.get('replies', []):
+                self.want.url(r.get('avatar'), 'support')
+                for att in r['attachments']:
+                    self.want.url(att['thumb'], 'support')
+                    ext = os.path.splitext(att['name'])[1].lower() or '.jpg'
+                    self.media.want('url:' + sha(att['href']), att['href'], 'media/support/%s%s' % (sha(att['href']), ext))
+                for f in r['fields']:
+                    for img in f['images']:
+                        self.want.url(img['href'], 'support')
+        self.flush('support')
 
     def do_likes(self):
         path = self.data('likes.json')
@@ -2450,6 +2555,8 @@ class Enricher:
             return self.tx_gifts(t)
         if parts[0] == 'profile':
             return self.tx_people_list(t)
+        if rel == 'other/support.html':
+            return self.tx_support(t)
         if parts[0] == 'likes' and len(parts) == 3:
             return self.tx_likes(t, parts[1])
         return t
@@ -2616,7 +2723,7 @@ class Enricher:
                 chip = ' <a class="ex-chip ex-chip-sm" href="%smessages/%d/messages0.html" title="Переписка">💬 %s</a>' % (
                     self.r.p, i, num(st['count']))
             return self.r.ava(i, 'ex-ava ex-ava-md') + m.group(1) + m.group(4) + '</a>' + chip
-        return re.sub(r'(<a href="(?:https?://vk\.(?:ru|com)/(id|club|public|event)(\d+))"(?: class="mem_link" )?>)(.*?)</a>', one, t, flags=re.S)
+        return re.sub(r'(<a href="(?:https?://vk\.(?:ru|com)/(id|club|public|event)(\d+))"(?: class="mem_link" ?)?>)(.*?)</a>', one, t, flags=re.S)
 
     def tx_likes(self, t, kind):
         store = self.likes.get(kind)
@@ -2645,6 +2752,49 @@ class Enricher:
                 extra = r.comment(o)
             return m.group(0) + '<div class="ex-like">%s</div>' % extra
         return re.sub(r'<a href="(https?://vk\.(?:ru|com)/[^"]+)">.*?</a>', one, t, flags=re.S)
+
+    def tx_support(self, t):
+        """Ticket links lead to the saved conversations; each item shows how many messages it has."""
+        def one(m):
+            ticket = self.support.get(m.group(1)) or {}
+            if not ticket.get('replies'):
+                return m.group(0)
+            return '<a href="support/%s.html">%s</a> <span class="ex-count">%s</span>' % (
+                m.group(1), m.group(2), num(len(ticket['replies'])))
+        t = re.sub(r'<a href="https?://vk\.(?:ru|com)/support\?act=show&(?:amp;)?id=(\d+)">(.*?)</a>', one, t, flags=re.S)
+        saved = self.r.p
+        for tid, ticket in self.support.items():
+            if ticket.get('replies'):
+                self.write_ticket(tid, ticket)
+        self.r.p = saved
+        return t
+
+    def write_ticket(self, tid, ticket):
+        r = self.r
+        r.p = '../../'
+
+        def local(u):
+            return r.local('url:' + sha(u)) if u else None
+
+        def picture(full, thumb, title=''):
+            return '<a class="ex-photo" href="%s" target="_blank" title="%s"><img src="%s" loading="lazy" alt=""></a>' % (
+                local(full) or esc(full), esc(title), local(full) or local(thumb) or esc(thumb))
+        rows = []
+        for reply in ticket['replies']:
+            ava = local(reply['avatar'])
+            ava = '<img class="ex-ava" src="%s" alt="">' % ava if ava else '<span class="ex-ava ex-ava-ph">%s</span>' % esc(reply['author'][:1])
+            fields = ''.join('<div class="ex-ticket-field"><span class="ex-dim">%s:</span> %s%s</div>' % (
+                esc(f['label']), f['value'], '<div class="ex-gallery ex-many">%s</div>' % ''.join(
+                    picture(i['href'], i['thumb']) for i in f['images']) if f['images'] else '') for f in reply['fields'])
+            gallery = ''.join(picture(a['href'], a['thumb'], a['name']) for a in reply['attachments'])
+            rows.append('<div class="ex-ticket-reply%s">%s<div class="ex-ticket-body"><div class="ex-head"><b>%s</b>'
+                        '<span class="ex-date">%s</span></div><div class="ex-text">%s</div>%s%s</div></div>' % (
+                            ' ex-mine' if reply['mine'] else '', ava, esc(reply['author']), esc(reply['date']), reply['text'],
+                            fields, '<div class="ex-gallery ex-many">%s</div>' % gallery if gallery else ''))
+        body = '<div class="ex-ticket-head"><div class="ex-conv-name">%s</div><div class="ex-dim">%s · %s</div></div>%s' % (
+            esc(ticket['title']), esc(ticket.get('status', '')), nplural(len(ticket['replies']), MSG_FORMS), ''.join(rows))
+        self.write_page('other/support/%s.html' % tid, self.crumbs([('Обращения в поддержку', '../support.html'),
+                                                                     (ticket['title'], None)]), body)
 
     def write_report(self):
         self.r.p = ''
@@ -2685,6 +2835,7 @@ class Enricher:
             self.do_photos()
             self.do_docs()
             self.do_profile()
+            self.do_support()
             self.do_likes()
             self.do_people()
             if self.api:
