@@ -7,13 +7,66 @@
 
   function $(s, el) { return (el || document).querySelector(s); }
   function $$(s, el) { return Array.prototype.slice.call((el || document).querySelectorAll(s)); }
+  /* Choices (theme, order, sorting...) live in localStorage and also travel in the page address:
+     Firefox gives every file opened from disk its own storage, so links to other archive pages
+     carry them along (?theme=dark&...). */
+  var PREFS = {exTheme: 'theme', exOldestFirst: 'old', exStatsMode: 'stats', exStatsNoGroups: 'nogroups', exPeerSort: 'sort'};
+  var fromAddress = {};
+  try {
+    var query = new URLSearchParams(location.search);
+    Object.keys(PREFS).forEach(function (k) {
+      if (query.has(PREFS[k])) {
+        fromAddress[k] = query.get(PREFS[k]);
+        try { localStorage.setItem(k, fromAddress[k]); } catch (e) { /* blocked storage */ }
+      }
+    });
+  } catch (e) { /* very old browser */ }
   function store(k, v) {
-    try {
-      if (v === undefined) return localStorage.getItem(k);
-      localStorage.setItem(k, v);
-    } catch (e) { /* private mode, blocked storage */ }
+    if (v === undefined) {
+      if (k in fromAddress) return fromAddress[k];
+      try { return localStorage.getItem(k); } catch (e) { return null; }
+    }
+    try { localStorage.setItem(k, v); } catch (e) { /* private mode, blocked storage */ }
+    if (PREFS[k]) {
+      fromAddress[k] = v;
+      try { history.replaceState(null, '', withPrefs(location.href)); } catch (e) { /* some browsers refuse for local files */ }
+    }
     return null;
   }
+  function withPrefs(href) {
+    try {
+      var url = new URL(href, location.href);
+      if (url.protocol !== location.protocol || !/\.html?$/i.test(url.pathname)) return href;
+      Object.keys(PREFS).forEach(function (k) {
+        var v = store(k);
+        if (v !== null && v !== undefined && v !== '') url.searchParams.set(PREFS[k], v);
+      });
+      return url.toString();
+    } catch (e) {
+      return href;
+    }
+  }
+  function go(href) { location.href = withPrefs(href); }
+  ['click', 'auxclick'].forEach(function (type) {  // every link to another archive page carries the choices
+    document.addEventListener(type, function (e) {
+      var a = e.target.closest ? e.target.closest('a[href]') : null;
+      var href = a && a.getAttribute('href');
+      if (!href || href.charAt(0) === '#') return;
+      var decorated = withPrefs(href);
+      if (decorated !== href) a.setAttribute('href', decorated);
+    }, true);
+  });
+  document.addEventListener('submit', function (e) {  // the "search in conversation" form
+    Object.keys(PREFS).forEach(function (k) {
+      var v = store(k);
+      if (v === null || v === undefined || v === '' || e.target.elements[PREFS[k]]) return;
+      var input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = PREFS[k];
+      input.value = v;
+      e.target.appendChild(input);
+    });
+  }, true);
   function pad(n) { return (n < 10 ? '0' : '') + n; }
   // archive times are "local wall clock" seconds, so read them with UTC getters
   function d(t) { return new Date(t * 1000); }
@@ -92,7 +145,7 @@
     }
     var here = location.pathname.split('/').pop();
     if (NAV.files[target] === here) { scrollToTime(t0); history.replaceState(null, '', '#t' + t0); }
-    else location.href = NAV.files[target] + '#t' + t0;
+    else go(NAV.files[target] + '#t' + t0);
   }
   function scrollToTime(t0) {
     var best = null, bestT = Infinity, newest = null, newestT = -1;
@@ -149,7 +202,7 @@
       if (i === cur) o.selected = true;
       sel.appendChild(o);
     });
-    sel.addEventListener('change', function () { location.href = sel.value; });
+    sel.addEventListener('change', function () { go(sel.value); });
     var label = $('.ex-pg-label', pg);
     label.parentNode.replaceChild(sel, label);
     if (kind !== 'messages') return;
@@ -196,7 +249,7 @@
     var a = null;
     if (e.key === 'ArrowLeft') a = $('.ex-pager a.ex-pg-prev');
     if (e.key === 'ArrowRight') a = $('.ex-pager a.ex-pg-next');
-    if (a) location.href = a.getAttribute('href');
+    if (a) go(a.getAttribute('href'));
   });
 
   /* ---------- photo viewer ---------- */

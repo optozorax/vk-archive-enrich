@@ -1557,8 +1557,10 @@ LIKE_LINK = {  # how each likes/<kind> page links its objects; the match is the 
     'topic_comment': r'vk\.(?:ru|com)/topic(-?\d+_\d+)\?reply=(\d+)',
     'market': r'vk\.(?:ru|com)/market\?w=product(-?\d+_\d+)"',
 }
-# runs in <head> before the page is drawn: the saved theme, or the system one (enrich.js adds the switch)
-THEME_SCRIPT = ("<script>(function(){var t=null;try{t=localStorage.getItem('exTheme')}catch(e){}"
+# runs in <head> before the page is drawn: the theme from the address (?theme=, see enrich.js), the saved one,
+# or the system one
+THEME_SCRIPT = ("<script>(function(){var t=null;try{t=new URLSearchParams(location.search).get('theme')}catch(e){}"
+                "if(!t){try{t=localStorage.getItem('exTheme')}catch(e){}}"
                 "if(t!=='dark'&&t!=='light')t=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';"
                 "document.documentElement.setAttribute('data-theme',t)})()</script>")
 HERE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))  # where assets/ lives
