@@ -1,0 +1,95 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # publishing the release
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests==2.34.2 pyflakes==3.4.0
+      - run: python -m pyflakes vk_archive_enrich.py vk_archive_enrich_gui.py tests/smoke_test.py
+      - run: python tests/smoke_test.py
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python packages
+        run: pip install pyinstaller==6.22.3 requests==2.34.2 yt-dlp==2026.8.19
+
+      - name: ffmpeg (LGPL build)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-8.1.zip' -OutFile ffmpeg.zip
+          "ffmpeg.zip sha256: $((Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash)"
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_src
+          $dir = Get-ChildItem ffmpeg_src -Directory | Select-Object -First 1
+          New-Item -ItemType Directory -Force packaging/bin | Out-Null
+          Copy-Item "$($dir.FullName)/bin/ffmpeg.exe" packaging/bin/
+          Copy-Item "$($dir.FullName)/LICENSE.txt" packaging/bin/FFMPEG_LICENSE.txt
+          & packaging/bin/ffmpeg.exe -hide_banner -version | Select-Object -First 1
+
+      - name: Build
+        run: pyinstaller packaging/vk_archive_enrich.spec --noconfirm --distpath dist --workpath build
+
+      - name: Docs into the folder
+        shell: pwsh
+        run: |
+          $out = 'dist/vk_archive_enrich'
+          Copy-Item README.md, LICENSE $out
+          Copy-Item packaging/README_RU.txt $out
+          Copy-Item packaging/bin/FFMPEG_LICENSE.txt $out
+
+      - name: Check the command line program
+        shell: pwsh
+        run: |
+          $v = & dist/vk_archive_enrich/vk_archive_enrich_cli.exe --version
+          $v
+          if ($v -notmatch 'ffmpeg: found') { throw 'ffmpeg is not bundled' }
+          python tests/smoke_test.py dist/vk_archive_enrich/vk_archive_enrich_cli.exe
+
+      - name: Check the window (a whole offline run started from it)
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'fixture'
+          python tests/smoke_test.py --make-archive $fixture
+          $env:VK_ARCHIVE_ENRICH_SELFTEST_ARCHIVE = $fixture
+          $p = Start-Process dist/vk_archive_enrich/vk_archive_enrich.exe -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "the window run ended with code $($p.ExitCode)" }
+          if (-not (Test-Path "$($fixture)_enriched/index.html")) { throw 'the window run produced no pages' }
+          'window run: ok'
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/vk_archive_enrich -DestinationPath vk_archive_enrich-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vk_archive_enrich-windows-x64
+          path: vk_archive_enrich-windows-x64.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vk_archive_enrich-windows-x64.zip
+          body_path: packaging/release-notes.md

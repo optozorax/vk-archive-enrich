@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""
+Settings window for vk_archive_enrich: choose the archive and what to download, press
+"Начать" and watch the log. The work itself runs in a separate process (the command line
+version), so "Стоп" can always end it; an interrupted run continues where it stopped.
+"""
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import webbrowser
+import tkinter as tk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+
+import vk_archive_enrich as core
+
+APP = 'VK Archive Enrich'
+REPO = 'https://github.com/optozorax/vk-archive-enrich'
+SECTIONS = [('messages', 'Сообщения'), ('wall', 'Стена'), ('comments', 'Ваши комментарии'),
+            ('albums', 'Фотоальбомы'), ('docs', 'Документы'), ('profile', 'Подарки и истории'),
+            ('likes', 'Лайки (гигабайты)')]
+MEDIA = [('photos', 'Фото'), ('videos', 'Видео'), ('covers', 'Обложки видео'), ('voice', 'Голосовые'),
+         ('music', 'Музыка'), ('docs', 'Документы'), ('stickers', 'Стикеры'), ('gifts', 'Подарки'),
+         ('avatars', 'Аватарки')]
+QUALITY = ['360', '480', '720', '1080', '1440', '2160']
+MAX_LOG_LINES = 5000
+
+
+def settings_path():
+    base = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), '.config')
+    return os.path.join(base, 'vk_archive_enrich', 'settings.json')
+
+
+def worker_command():
+    """The command line version: the _cli.exe next to us in the Windows build, else this Python."""
+    if core.FROZEN:
+        return [os.path.join(os.path.dirname(sys.executable), 'vk_archive_enrich_cli.exe')]
+    return [sys.executable, '-u', os.path.abspath(core.__file__)]
+
+
+def open_path(path):
+    if os.name == 'nt':
+        os.startfile(path)  # noqa: the Windows way to open a file in its default program
+    else:
+        webbrowser.open('file://' + os.path.abspath(path))
+
+
+class TokenDialog(tk.Toplevel):
+    """Explains how to get a token in the browser console and reads it (hidden)."""
+
+    def __init__(self, parent, expired):
+        super().__init__(parent)
+        self.title('Токен VK')
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill='both', expand=True)
+        intro = ('Токен истёк: они живут около часа. Получите новый так же, как в первый раз.\n\n' if expired else '')
+        ttk.Label(f, wraplength=520, justify='left', text=intro +
+                  '1. Откройте vk.ru в браузере (вы должны быть залогинены).\n'
+                  '2. Нажмите F12 и откройте вкладку Console (Консоль).\n'
+                  '3. Вставьте строку ниже и нажмите Enter, затем скопируйте токен из появившегося окна.').pack(anchor='w')
+        row = ttk.Frame(f)
+        row.pack(fill='x', pady=8)
+        snippet = ttk.Entry(row, width=64)
+        snippet.insert(0, core.TOKEN_SNIPPET)
+        snippet.configure(state='readonly')
+        snippet.pack(side='left', fill='x', expand=True)
+        ttk.Button(row, text='Скопировать', command=lambda: (self.clipboard_clear(), self.clipboard_append(core.TOKEN_SNIPPET))).pack(side='left', padx=(6, 0))
+        ttk.Label(f, text='Токен:').pack(anchor='w', pady=(6, 2))
+        self.entry = ttk.Entry(f, show='•', width=64)
+        self.entry.pack(fill='x')
+        self.entry.focus_set()
+        buttons = ttk.Frame(f)
+        buttons.pack(fill='x', pady=(12, 0))
+        ttk.Button(buttons, text='Отмена', command=self.destroy).pack(side='right')
+        ttk.Button(buttons, text='OK', command=self.ok).pack(side='right', padx=6)
+        self.bind('<Return>', lambda e: self.ok())
+        self.bind('<Escape>', lambda e: self.destroy())
+        self.grab_set()
+
+    def ok(self):
+        self.result = self.entry.get().strip()
+        self.destroy()
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.proc = None
+        self.lines = queue.Queue()
+        self.dst_auto = ''
+        root.title('%s %s' % (APP, core.__version__))
+        root.minsize(720, 520)
+        try:
+            self.icon = tk.PhotoImage(file=os.path.join(core.HERE, 'assets', 'icon.png'))
+            root.iconphoto(True, self.icon)
+        except tk.TclError:
+            pass
+        self.src = tk.StringVar()
+        self.dst = tk.StringVar()
+        self.login = tk.StringVar(value='auto')
+        self.cookies = tk.StringVar()
+        self.token = tk.StringVar()
+        self.sections = {k: tk.BooleanVar(value=(k != 'likes')) for k, _ in SECTIONS}
+        self.media = {k: tk.BooleanVar(value=True) for k, _ in MEDIA}
+        self.activity = tk.BooleanVar(value=True)
+        self.quality = tk.StringVar(value='1080')
+        self.offline = tk.BooleanVar(value=False)
+        self.status = tk.StringVar(value='Выберите папку с архивом VK и нажмите «Начать».')
+        self.load_settings()
+        self.build()
+        self.src.trace_add('write', self.src_changed)
+        root.protocol('WM_DELETE_WINDOW', self.on_close)
+        root.after(100, self.poll)
+
+    # -- layout --
+    def build(self):
+        outer = ttk.Frame(self.root, padding=12)
+        outer.pack(fill='both', expand=True)
+        outer.columnconfigure(0, weight=1)
+
+        box = ttk.LabelFrame(outer, text='Архив', padding=10)
+        box.grid(row=0, column=0, sticky='ew')
+        box.columnconfigure(1, weight=1)
+        ttk.Label(box, text='Папка архива VK:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(box, textvariable=self.src).grid(row=0, column=1, sticky='ew', padx=6)
+        ttk.Button(box, text='Выбрать…', command=self.pick_src).grid(row=0, column=2)
+        ttk.Label(box, text='Сохранить в:').grid(row=1, column=0, sticky='w', pady=(6, 0))
+        ttk.Entry(box, textvariable=self.dst).grid(row=1, column=1, sticky='ew', padx=6, pady=(6, 0))
+        ttk.Button(box, text='Выбрать…', command=self.pick_dst).grid(row=1, column=2, pady=(6, 0))
+        ttk.Label(box, foreground='#6d7885', text='Папка распакованного архива — та, где лежит index.html. '
+                  'Исходный архив не меняется.').grid(row=2, column=0, columnspan=3, sticky='w', pady=(4, 0))
+
+        box = ttk.LabelFrame(outer, text='Вход во ВКонтакте', padding=10)
+        box.grid(row=1, column=0, sticky='ew', pady=(10, 0))
+        box.columnconfigure(1, weight=1)
+        ttk.Radiobutton(box, text='Взять из браузера (Firefox — автоматически)', value='auto', variable=self.login).grid(
+            row=0, column=0, columnspan=3, sticky='w')
+        ttk.Radiobutton(box, text='Файл cookies.txt:', value='cookies', variable=self.login).grid(row=1, column=0, sticky='w', pady=(4, 0))
+        ttk.Entry(box, textvariable=self.cookies).grid(row=1, column=1, sticky='ew', padx=6, pady=(4, 0))
+        ttk.Button(box, text='Выбрать…', command=self.pick_cookies).grid(row=1, column=2, pady=(4, 0))
+        ttk.Radiobutton(box, text='Токен:', value='token', variable=self.login).grid(row=2, column=0, sticky='w', pady=(4, 0))
+        ttk.Entry(box, textvariable=self.token, show='•').grid(row=2, column=1, sticky='ew', padx=6, pady=(4, 0))
+        ttk.Button(box, text='Как получить?', command=self.token_help).grid(row=2, column=2, pady=(4, 0))
+        ttk.Label(box, foreground='#6d7885', text='Chrome и Edge не дают читать свои cookies: для них cookies.txt '
+                  '(расширение «Get cookies.txt LOCALLY») или токен.').grid(row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
+
+        row = ttk.Frame(outer)
+        row.grid(row=2, column=0, sticky='ew', pady=(10, 0))
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, weight=1)
+        box = ttk.LabelFrame(row, text='Что скачать', padding=10)
+        box.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
+        for i, (k, label) in enumerate(SECTIONS):
+            ttk.Checkbutton(box, text=label, variable=self.sections[k]).grid(row=i // 2, column=i % 2, sticky='w', padx=(0, 12))
+        box = ttk.LabelFrame(row, text='Какие файлы', padding=10)
+        box.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
+        for i, (k, label) in enumerate(MEDIA):
+            ttk.Checkbutton(box, text=label, variable=self.media[k]).grid(row=i // 3, column=i % 3, sticky='w', padx=(0, 12))
+
+        box = ttk.LabelFrame(outer, text='Дополнительно', padding=10)
+        box.grid(row=3, column=0, sticky='ew', pady=(10, 0))
+        ttk.Checkbutton(box, text='Статистика и календари активности', variable=self.activity).grid(row=0, column=0, sticky='w')
+        ttk.Label(box, text='Видео не выше:').grid(row=0, column=1, sticky='e', padx=(24, 4))
+        ttk.Combobox(box, textvariable=self.quality, values=QUALITY, width=6, state='readonly').grid(row=0, column=2, sticky='w')
+        ttk.Checkbutton(box, text='Только пересобрать страницы', variable=self.offline).grid(row=0, column=3, sticky='w', padx=(24, 0))
+
+        bar = ttk.Frame(outer)
+        bar.grid(row=4, column=0, sticky='ew', pady=(12, 0))
+        self.btn_start = ttk.Button(bar, text='Начать', command=self.start)
+        self.btn_start.pack(side='left')
+        self.btn_stop = ttk.Button(bar, text='Стоп', command=self.stop, state='disabled')
+        self.btn_stop.pack(side='left', padx=6)
+        self.btn_open = ttk.Button(bar, text='Открыть результат', command=self.open_result)
+        self.btn_open.pack(side='left')
+        ttk.Button(bar, text='Папка', command=self.open_folder).pack(side='left', padx=6)
+        ttk.Button(bar, text='Справка', command=lambda: webbrowser.open(REPO + '#readme')).pack(side='right')
+
+        self.progress = ttk.Progressbar(outer, mode='determinate', maximum=100)
+        self.progress.grid(row=5, column=0, sticky='ew', pady=(10, 2))
+        ttk.Label(outer, textvariable=self.status).grid(row=6, column=0, sticky='w')
+
+        mono = tkfont.Font(family='Consolas' if os.name == 'nt' else 'monospace', size=9)
+        self.log = ScrolledText(outer, height=7, font=mono, wrap='word', state='disabled', background='#fbfbfc')
+        self.log.grid(row=7, column=0, sticky='nsew', pady=(8, 0))
+        outer.rowconfigure(7, weight=1)
+
+    # -- pickers --
+    def pick_src(self):
+        d = filedialog.askdirectory(title='Папка с распакованным архивом VK (там лежит index.html)')
+        if d:
+            self.src.set(os.path.normpath(d))
+
+    def pick_dst(self):
+        d = filedialog.askdirectory(title='Куда сохранить дополненный архив')
+        if d:
+            self.dst.set(os.path.normpath(d))
+
+    def pick_cookies(self):
+        f = filedialog.askopenfilename(title='cookies.txt', filetypes=[('cookies.txt', '*.txt'), ('Все файлы', '*.*')])
+        if f:
+            self.cookies.set(os.path.normpath(f))
+            self.login.set('cookies')
+
+    def src_changed(self, *_):
+        src = self.src.get().strip().rstrip('\\/')
+        if src and (not self.dst.get().strip() or self.dst.get() == self.dst_auto):
+            self.dst_auto = src + '_enriched'
+            self.dst.set(self.dst_auto)
+
+    def token_help(self):
+        d = TokenDialog(self.root, expired=False)
+        self.root.wait_window(d)
+        if d.result:
+            self.token.set(d.result)
+            self.login.set('token')
+
+    # -- settings --
+    def load_settings(self):
+        try:
+            with open(settings_path(), encoding='utf-8') as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            return
+        for name in ('src', 'dst', 'login', 'cookies', 'quality'):
+            if isinstance(s.get(name), str):
+                getattr(self, name).set(s[name])
+        for name in ('activity', 'offline'):
+            if isinstance(s.get(name), bool):
+                getattr(self, name).set(s[name])
+        for k, v in (s.get('sections') or {}).items():
+            if k in self.sections:
+                self.sections[k].set(bool(v))
+        for k, v in (s.get('media') or {}).items():
+            if k in self.media:
+                self.media[k].set(bool(v))
+        self.dst_auto = self.src.get().rstrip('\\/') + '_enriched' if self.src.get() else ''
+
+    def save_settings(self):  # the token is deliberately not saved
+        s = {name: getattr(self, name).get() for name in ('src', 'dst', 'login', 'cookies', 'quality', 'activity', 'offline')}
+        s['sections'] = {k: v.get() for k, v in self.sections.items()}
+        s['media'] = {k: v.get() for k, v in self.media.items()}
+        try:
+            os.makedirs(os.path.dirname(settings_path()), exist_ok=True)
+            with open(settings_path(), 'w', encoding='utf-8') as f:
+                json.dump(s, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    # -- running --
+    def command(self):
+        src = self.src.get().strip()
+        if not src or not os.path.isfile(os.path.join(src, 'index.html')):
+            messagebox.showerror(APP, 'В выбранной папке нет index.html. Укажите папку распакованного архива VK.')
+            return None
+        args = [src]
+        if self.dst.get().strip():
+            args.append(self.dst.get().strip())
+        if self.offline.get():
+            args.append('--offline')
+        elif self.login.get() == 'cookies':
+            if not os.path.isfile(self.cookies.get()):
+                messagebox.showerror(APP, 'Выберите файл cookies.txt.')
+                return None
+            args += ['--cookies', self.cookies.get()]
+        elif self.login.get() == 'token':
+            args += ['--token', 'ask']  # the token itself goes through stdin, not the command line
+        sections = [k for k, _ in SECTIONS if self.sections[k].get()]
+        if not sections and not self.offline.get():
+            messagebox.showerror(APP, 'Отметьте хотя бы один раздел.')
+            return None
+        args += ['--only', ','.join(sections or ['messages'])]
+        off = [k for k, _ in MEDIA if not self.media[k].get()]
+        if off:
+            args += ['--no-media', ','.join(off)]
+        if self.activity.get():
+            args.append('--github-activity')
+        args += ['--max-video-height', self.quality.get()]
+        return worker_command() + args
+
+    def start(self):
+        if self.proc:
+            return
+        cmd = self.command()
+        if not cmd:
+            return
+        self.save_settings()
+        self.clear_log()
+        self.append('Запуск: %s\n' % ' '.join(cmd[len(worker_command()):]))
+        env = dict(os.environ, VK_ARCHIVE_ENRICH_GUI='1', PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         env=env, creationflags=core.NO_WINDOW, start_new_session=(os.name != 'nt'))
+        except OSError as e:
+            messagebox.showerror(APP, 'Не удалось запустить: %s' % e)
+            self.proc = None
+            return
+        threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
+        self.btn_start.configure(state='disabled')
+        self.btn_stop.configure(state='normal')
+        self.progress.configure(mode='indeterminate')
+        self.progress.start(12)
+        self.status.set('Работаю…')
+
+    def reader(self, proc):
+        for raw in iter(proc.stdout.readline, b''):
+            self.lines.put(raw.decode('utf-8', 'replace'))
+        self.lines.put(None)
+
+    def stop(self):
+        if not self.proc:
+            return
+        self.status.set('Останавливаю…')
+        if os.name == 'nt':  # the worker may have ffmpeg children: end the whole tree
+            subprocess.run(['taskkill', '/PID', str(self.proc.pid), '/T', '/F'], capture_output=True, creationflags=core.NO_WINDOW)
+        else:
+            import signal
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except OSError:
+                self.proc.terminate()
+
+    def poll(self):
+        try:
+            while True:
+                line = self.lines.get_nowait()
+                if line is None:
+                    self.finished()
+                    break
+                self.handle(line)
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll)
+
+    def handle(self, line):
+        m = re.search(r'@@VKAE_ASK_TOKEN (\w+)@@', line)
+        if m:
+            self.answer_token(m.group(1) == 'expired')
+            return
+        self.append(line)
+        m = re.search(r'downloads: (\d+)/(\d+) done', line)
+        if m and int(m.group(2)):
+            done, total = int(m.group(1)), int(m.group(2))
+            self.determinate(100.0 * done / total)
+            self.status.set('Файлы: %s из %s' % (core.num(done), core.num(total)))
+            return
+        m = re.search(r'\[(\d+)/(\d+)\] peer', line)
+        if m:
+            self.status.set('Переписки: %s из %s' % m.groups())
+        elif 'Rendering pages' in line:
+            self.indeterminate()
+            self.status.set('Собираю страницы…')
+        elif 'Archive:' in line:
+            self.status.set('Читаю архив…')
+        elif re.search(r'Likes/|Wall:|My comments|Photo albums|Documents:|People:', line):
+            self.status.set(line.split(' ', 1)[-1].strip())
+
+    def answer_token(self, expired):
+        token = '' if expired else self.token.get().strip()
+        if not token:
+            d = TokenDialog(self.root, expired)
+            self.root.wait_window(d)
+            token = d.result or ''
+            if token:
+                self.token.set(token)
+        try:
+            self.proc.stdin.write((token + '\n').encode('utf-8'))
+            self.proc.stdin.flush()
+        except (OSError, AttributeError):
+            pass
+
+    def finished(self):
+        code = self.proc.wait() if self.proc else 0
+        self.proc = None
+        self.btn_start.configure(state='normal')
+        self.btn_stop.configure(state='disabled')
+        self.on_finished(code)
+        if code == 0:
+            self.determinate(100)
+            self.status.set('Готово! Нажмите «Открыть результат».')
+            self.root.bell()
+        else:
+            self.determinate(0)
+            self.status.set('Остановлено (код %s). Запустите снова — скачанное сохранится, работа продолжится.' % code)
+
+    def on_finished(self, code):  # replaced by the build self-test
+        pass
+
+    def determinate(self, value):
+        if str(self.progress.cget('mode')) != 'determinate':
+            self.progress.stop()
+            self.progress.configure(mode='determinate')
+        self.progress['value'] = value
+
+    def indeterminate(self):
+        if str(self.progress.cget('mode')) != 'indeterminate':
+            self.progress.configure(mode='indeterminate')
+            self.progress.start(12)
+
+    def append(self, text):
+        self.log.configure(state='normal')
+        self.log.insert('end', text)
+        lines = int(self.log.index('end-1c').split('.')[0])
+        if lines > MAX_LOG_LINES:
+            self.log.delete('1.0', '%d.0' % (lines - MAX_LOG_LINES))
+        self.log.see('end')
+        self.log.configure(state='disabled')
+
+    def clear_log(self):
+        self.log.configure(state='normal')
+        self.log.delete('1.0', 'end')
+        self.log.configure(state='disabled')
+
+    def result_dir(self):
+        return self.dst.get().strip() or (self.src.get().strip().rstrip('\\/') + '_enriched')
+
+    def open_result(self):
+        index = os.path.join(self.result_dir(), 'index.html')
+        if os.path.isfile(index):
+            open_path(index)
+        else:
+            messagebox.showinfo(APP, 'Результата ещё нет: сначала нажмите «Начать».')
+
+    def open_folder(self):
+        d = self.result_dir()
+        if os.path.isdir(d):
+            open_path(d)
+        elif os.path.isdir(self.src.get()):
+            open_path(self.src.get())
+
+    def on_close(self):
+        if self.proc and not messagebox.askyesno(APP, 'Работа ещё идёт. Остановить и закрыть? Скачанное сохранится.'):
+            return
+        self.stop()
+        self.root.destroy()
+
+
+def main():
+    if os.name == 'nt':
+        try:  # crisp text on high-DPI screens
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    root = tk.Tk()
+    try:
+        tkfont.nametofont('TkDefaultFont').configure(size=10)
+        tkfont.nametofont('TkTextFont').configure(size=10)
+    except tk.TclError:
+        pass
+    app = App(root)
+    root.update_idletasks()  # never taller than the screen (1080p laptops at 150% are only ~700pt tall)
+    height = min(root.winfo_reqheight(), root.winfo_screenheight() - 90)
+    root.geometry('%dx%d+%d+%d' % (root.winfo_reqwidth(), height, max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2), 20))
+    # hooks for the automatic build checks; they never save settings
+    if os.environ.get('VK_ARCHIVE_ENRICH_SELFTEST'):  # the window opens and closes
+        app.save_settings = lambda: None
+        root.after(int(os.environ['VK_ARCHIVE_ENRICH_SELFTEST']), root.destroy)
+    if os.environ.get('VK_ARCHIVE_ENRICH_SELFTEST_ARCHIVE'):  # a whole offline run through the window
+        app.save_settings = lambda: None
+        app.src.set(os.environ['VK_ARCHIVE_ENRICH_SELFTEST_ARCHIVE'])
+        app.offline.set(True)
+        app.on_finished = lambda code: (setattr(app, 'exit_code', code), root.after(300, root.destroy))
+        root.after(300, app.start)
+    root.mainloop()
+    sys.exit(getattr(app, 'exit_code', 0))
+
+
+if __name__ == '__main__':
+    main()

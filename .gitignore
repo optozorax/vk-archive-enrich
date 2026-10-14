@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 cookies.txt
 *_enriched/
+build/
+dist/
+packaging/bin/
+*.spec.bak

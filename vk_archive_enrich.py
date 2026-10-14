@@ -42,10 +42,25 @@ try:
 except ImportError:
     sys.exit('This script needs the "requests" package: pip install requests')
 
+__version__ = '1.0.0'
 API_VERSION = '5.199'
 WEB_APP_ID = '6287487'  # app id of the vk.ru web client; its token can read messages
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'
 VK = 'https://vk.ru'
+FROZEN = getattr(sys, 'frozen', False)  # running from the Windows build (PyInstaller)
+NO_WINDOW = 0x08000000 if os.name == 'nt' else 0  # CREATE_NO_WINDOW: no console flashing for ffmpeg
+
+
+def find_ffmpeg():
+    """ffmpeg shipped next to the program (Windows build) or installed on PATH."""
+    exe = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
+    for d in (getattr(sys, '_MEIPASS', None), os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else None):
+        if d and os.path.isfile(os.path.join(d, exe)):
+            return os.path.join(d, exe)
+    return shutil.which('ffmpeg')
+
+
+FFMPEG = find_ffmpeg()
 
 
 # ----------------------------------------------------------------------------
@@ -287,6 +302,12 @@ TOKEN_SNIPPET = ("fetch('https://login.vk.ru/?act=web_token',{method:'POST',cred
 
 def ask_token(expired=False):
     """Read a token typed / pasted by the user (hidden, so it stays out of shell history)."""
+    if os.environ.get('VK_ARCHIVE_ENRICH_GUI'):  # the window answers on stdin
+        print('@@VKAE_ASK_TOKEN %s@@' % ('expired' if expired else 'new'), flush=True)
+        token = sys.stdin.readline().strip()
+        if not token:
+            sys.exit('No token given.')
+        return token
     if not sys.stdin.isatty():
         sys.exit('The VK token %s and there is no terminal to ask for a new one.' % ('expired' if expired else 'is missing'))
     print('\n%s Open vk.ru in your browser, press F12 -> Console, paste this line and press Enter:\n\n    %s\n\n'
@@ -761,24 +782,37 @@ class Media:
         return None if os.path.getsize(tmp) == total else 'size mismatch after joining pieces'
 
     def _ffmpeg(self, url, tmp, fmt):
-        args = ['ffmpeg', '-y', '-loglevel', 'error', '-i', url, '-c', 'copy']
+        if not FFMPEG:
+            return 'ffmpeg not found'
+        args = [FFMPEG, '-y', '-loglevel', 'error', '-i', url, '-c', 'copy']
         if fmt == 'mp4':
             args += ['-bsf:a', 'aac_adtstoasc']
-        p = subprocess.run(args + ['-f', fmt, tmp], capture_output=True, text=True, timeout=3600)
+        p = subprocess.run(args + ['-f', fmt, tmp], capture_output=True, text=True, errors='replace',
+                           timeout=3600, creationflags=NO_WINDOW)
         return None if p.returncode == 0 and os.path.getsize(tmp) > 0 else 'ffmpeg: ' + p.stderr.strip()[-200:]
 
     def _ytdlp(self, url, tmp, height):
-        args = ['yt-dlp', '--no-progress', '--no-playlist', '-q', '-f',
-                'bv*[height<=%d]+ba/b[height<=%d]/b' % (height, height),
-                '--merge-output-format', 'mp4', '-o', tmp, url]
+        """YouTube & co. through yt-dlp used as a library (also works inside the Windows build)."""
+        try:
+            import yt_dlp
+        except ImportError:
+            return 'yt-dlp is not installed (pip install yt-dlp)'
+        opts = {'format': 'bv*[height<=%d]+ba/b[height<=%d]/b' % (height, height), 'merge_output_format': 'mp4',
+                'outtmpl': tmp + '.%(ext)s', 'noplaylist': True, 'quiet': True, 'no_warnings': True, 'noprogress': True}
+        if FFMPEG:
+            opts['ffmpeg_location'] = FFMPEG
         if self.ytdlp_cookies:
-            args[1:1] = ['--cookies', self.ytdlp_cookies]
-        p = subprocess.run(args, capture_output=True, text=True, timeout=7200)
-        if p.returncode == 0 and not os.path.exists(tmp):  # yt-dlp may append an extension
-            for f in glob.glob(glob.escape(tmp) + '*'):
+            opts['cookiefile'] = self.ytdlp_cookies
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            return 'yt-dlp: %s' % str(e).strip()[-200:]
+        for f in glob.glob(glob.escape(tmp) + '.*'):
+            if not f.endswith(('.part', '.ytdl')):
                 os.replace(f, tmp)
-                break
-        return None if p.returncode == 0 and os.path.exists(tmp) else 'yt-dlp: ' + p.stderr.strip()[-200:]
+                return None
+        return 'yt-dlp: no file was produced'
 
     def _one(self, rel, url, method, limit, keys):
         dest = os.path.join(self.dst, rel)
@@ -1520,7 +1554,7 @@ LIKE_LINK = {  # how each likes/<kind> page links its objects; the match is the 
     'topic_comment': r'vk\.(?:ru|com)/topic(-?\d+_\d+)\?reply=(\d+)',
     'market': r'vk\.(?:ru|com)/market\?w=product(-?\d+_\d+)"',
 }
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))  # where assets/ lives
 
 
 def like_key(m):
@@ -2710,6 +2744,9 @@ def parse_list(value, allowed, what):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a console that cannot show some character must not crash the run
+        if stream and hasattr(stream, 'reconfigure'):
+            stream.reconfigure(errors='replace')
     ap = argparse.ArgumentParser(
         prog='vk_archive_enrich.py', formatter_class=argparse.RawDescriptionHelpFormatter,
         description='Дополняет официальный архив данных VK: скачивает фото, видео, голосовые, документы, '
@@ -2720,6 +2757,8 @@ def main():
                '  python3 vk_archive_enrich.py Archive --only messages --no-media videos,music\n'
                '  python3 vk_archive_enrich.py Archive --browser chrome\n'
                '  python3 vk_archive_enrich.py Archive --offline              # пересобрать страницы без интернета\n')
+    ap.add_argument('--version', action='version', version='vk_archive_enrich %s (ffmpeg: %s)' % (
+        __version__, 'found' if FFMPEG else 'not found'))
     ap.add_argument('src', help='распакованный архив VK (папка с index.html)')
     ap.add_argument('dst', nargs='?', help='куда сложить результат (по умолчанию <архив>_enriched)')
     g = ap.add_argument_group('вход в VK')
@@ -2748,6 +2787,19 @@ def main():
     g.add_argument('--workers', type=int, default=8, help='параллельных загрузок фото и файлов (8)')
     g.add_argument('--video-workers', type=int, default=4, help='параллельных загрузок видео и музыки (4)')
     g.add_argument('--segments', type=int, default=6, help='соединений на один большой файл (6)')
+    if len(sys.argv) == 1:  # no arguments: a double-click or a plain run - open the window
+        if FROZEN:
+            ap.print_help()
+            input('\nЭто консольная версия. Окно настроек открывает vk_archive_enrich.exe. Нажмите Enter...')
+            return
+        try:
+            import vk_archive_enrich_gui
+        except ImportError as e:  # no tkinter on this system
+            ap.print_help()
+            log('(the settings window is unavailable: %s)' % e)
+            return
+        vk_archive_enrich_gui.main()
+        return
     args = ap.parse_args()
 
     sections = set(SECTIONS) - {'likes'}
@@ -2758,7 +2810,7 @@ def main():
     sections -= set(parse_list(args.skip, SECTIONS, 'section'))
     args.sections = sections
     args.no_media = parse_list(args.no_media, list(MEDIA_KINDS), 'media type')
-    if not shutil.which('ffmpeg') and 'music' not in args.no_media:
+    if not FFMPEG and 'music' not in args.no_media:
         log('note: ffmpeg not found - music tracks will not be downloaded')
         args.no_media.append('music')
     try:
