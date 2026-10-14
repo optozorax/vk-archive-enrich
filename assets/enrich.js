@@ -24,6 +24,44 @@
     return String(s).replace(/[&<>"]/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]; });
   }
 
+  /* ---------- theme: system / dark / light (the <head> script already applied it before drawing) ---------- */
+  var THEMES = ['auto', 'dark', 'light'];
+  var THEME_ICON = {  // half circle = like the system, moon = dark, sun = light
+    auto: '<svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm0 2v14a7 7 0 0 1 0-14z"/></svg>',
+    dark: '<svg viewBox="0 0 24 24"><path d="M20.5 14.6A8.5 8.5 0 0 1 9.4 3.5a8.5 8.5 0 1 0 11.1 11.1z"/></svg>',
+    light: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.6"/><path d="M11 1.5h2v3h-2zm0 18h2v3h-2zM1.5 11h3v2h-3zm18 0h3v2h-3zM4.2 5.6l1.4-1.4 2.1 2.1-1.4 1.4zm12.7 12.7 1.4-1.4 2.1 2.1-1.4 1.4zM4.2 18.4l2.1-2.1 1.4 1.4-2.1 2.1zM16.9 6.3l2.1-2.1 1.4 1.4-2.1 2.1z"/></svg>'
+  };
+  var THEME_NAME = {auto: 'как в системе', dark: 'тёмная', light: 'светлая'};
+  var systemDark = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  function themeChoice() { var t = store('exTheme'); return THEMES.indexOf(t) > 0 ? t : 'auto'; }
+  function applyTheme() {
+    var choice = themeChoice();
+    var dark = choice === 'dark' || (choice === 'auto' && systemDark && systemDark.matches);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+    if (themeBtn) {
+      themeBtn.innerHTML = THEME_ICON[choice];
+      themeBtn.title = 'Тема: ' + THEME_NAME[choice] + ' (нажмите, чтобы сменить)';
+    }
+  }
+  var themeBtn = null;
+  var headerBox = $('.page_header');
+  if (headerBox) {
+    themeBtn = document.createElement('button');
+    themeBtn.type = 'button';
+    themeBtn.className = 'ex-theme';
+    themeBtn.addEventListener('click', function () {
+      store('exTheme', THEMES[(THEMES.indexOf(themeChoice()) + 1) % THEMES.length]);
+      applyTheme();
+    });
+    headerBox.appendChild(themeBtn);
+  }
+  if (systemDark) {
+    var onSystem = function () { if (themeChoice() === 'auto') applyTheme(); };
+    if (systemDark.addEventListener) systemDark.addEventListener('change', onSystem);
+    else if (systemDark.addListener) systemDark.addListener(onSystem);
+  }
+  applyTheme();
+
   /* ---------- tooltips for [data-tip] (heatmaps, charts, gallery) ---------- */
   var tip = document.createElement('div');
   tip.className = 'ex-tip';
@@ -248,7 +286,6 @@
   function keyDate(k) { var p = k.split('-'); return p[2] + '.' + p[1] + '.' + p[0]; }
 
   function initStats() {
-    var HEAT = ['#ebedf0', '#b7d3f6', '#6da7ec', '#2a78d6', '#184f95'];
     var MSHORT = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
     var WD = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'];
     var mode = store('exStatsMode') || 'sent';
@@ -291,7 +328,7 @@
           var dd = new Date(t), k = y + '-' + pad(dd.getUTCMonth() + 1) + '-' + pad(dd.getUTCDate());
           var c = dayVal(k), idx = i + lead, x = 26 + Math.floor(idx / 7) * 12, yy = 16 + (idx % 7) * 12;
           total += c;
-          var rect = '<rect x="' + x + '" y="' + yy + '" width="10" height="10" rx="2" fill="' + HEAT[level(c)] +
+          var rect = '<rect x="' + x + '" y="' + yy + '" width="10" height="10" rx="2" class="h' + level(c) +
                      '" data-tip="' + escapeHtml(dayTip(k, c)) + '"/>';
           var href = c && ST.links ? ST.links[k] : null;
           cells += href ? '<a href="' + escapeHtml(href) + '">' + rect + '</a>' : rect;
@@ -303,7 +340,7 @@
                '</span></div><svg class="ex-heat" viewBox="0 0 ' + width + ' 102" width="' + width + '" role="img" aria-label="' + y +
                '">' + months + wd + cells + '</svg></div>';
       }).join('');
-      var legend = '<div class="ex-heat-legend">меньше ' + HEAT.map(function (c) { return '<i style="background:' + c + '"></i>'; }).join('') + ' больше</div>';
+      var legend = '<div class="ex-heat-legend">меньше ' + [0, 1, 2, 3, 4].map(function (l) { return '<i class="h' + l + '"></i>'; }).join('') + ' больше</div>';
       return '<div class="ex-heatmap">' + out + legend + '</div>';
     }
 

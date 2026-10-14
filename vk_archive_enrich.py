@@ -1557,6 +1557,10 @@ LIKE_LINK = {  # how each likes/<kind> page links its objects; the match is the 
     'topic_comment': r'vk\.(?:ru|com)/topic(-?\d+_\d+)\?reply=(\d+)',
     'market': r'vk\.(?:ru|com)/market\?w=product(-?\d+_\d+)"',
 }
+# runs in <head> before the page is drawn: the saved theme, or the system one (enrich.js adds the switch)
+THEME_SCRIPT = ("<script>(function(){var t=null;try{t=localStorage.getItem('exTheme')}catch(e){}"
+                "if(t!=='dark'&&t!=='light')t=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';"
+                "document.documentElement.setAttribute('data-theme',t)})()</script>")
 HERE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))  # where assets/ lives
 
 
@@ -2071,8 +2075,8 @@ class Enricher:
         t = re.sub(r'<meta charset="windows-1251">', '<meta charset="utf-8">', t, count=1, flags=re.I)
         if 'enrich.css' not in t:
             t = re.sub(r'(<link rel="stylesheet" type="text/css" href="(?:\.\./)*style\.css">)',
-                       r'\1\n  <link rel="stylesheet" type="text/css" href="%senrich.css">\n'
-                       r'  <script src="%senrich.js" defer></script>' % (p, p), t, count=1)
+                       lambda m: '%s\n  <link rel="stylesheet" type="text/css" href="%senrich.css">\n'
+                                 '  %s\n  <script src="%senrich.js" defer></script>' % (m.group(1), p, THEME_SCRIPT, p), t, count=1)
         if '<meta name="viewport"' not in t:
             t = t.replace('<meta charset="utf-8">', '<meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">', 1)
         t = t.replace('<body>', '<body data-root="%s">' % p, 1)
@@ -2296,7 +2300,7 @@ class Enricher:
 
     def write_page(self, rel, crumbs, body, extra_head=''):
         p = '../' * rel.count('/')
-        page = PAGE.format(p=p, crumbs=crumbs, body=body, head=extra_head)
+        page = PAGE.format(p=p, crumbs=crumbs, body=body, head=extra_head, theme=THEME_SCRIPT)
         path = os.path.join(self.dst, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
@@ -2868,6 +2872,7 @@ PAGE = '''<!DOCTYPE html>
   <title>VK</title>
   <link rel="stylesheet" type="text/css" href="{p}style.css">
   <link rel="stylesheet" type="text/css" href="{p}enrich.css">
+  {theme}
   <script src="{p}enrich.js" defer></script>
   {head}
 </head>
