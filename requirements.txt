@@ -1,0 +1,3 @@
+requests>=2.25
+# optional: cookies from Chrome / Edge / Brave / Opera / Vivaldi / Safari and --external-videos
+# yt-dlp>=2024.8.6
