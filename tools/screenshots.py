@@ -122,9 +122,10 @@ def main():
                 page.wait_for_timeout(300)
                 x0 = max(0, int(box['x']) - 24)
                 x1 = min(1100, int(box['x'] + box['width']) + 24)
-                out = os.path.join(a.out, name + '.png')
-                page.screenshot(path=out, clip={'x': x0, 'y': 0, 'width': x1 - x0, 'height': min(height, total)})
-                Image.open(out).save(out, optimize=True)
+                png = os.path.join(work, name + '.png')
+                page.screenshot(path=png, clip={'x': x0, 'y': 0, 'width': x1 - x0, 'height': min(height, total)})
+                out = os.path.join(a.out, name + '.jpg')  # JPEG keeps the repository small
+                Image.open(png).convert('RGB').save(out, 'JPEG', quality=82, optimize=True, progressive=True)
                 print('saved', os.path.relpath(out, ROOT), '%d KB' % (os.path.getsize(out) // 1024))
             browser.close()
     finally:

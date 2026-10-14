@@ -64,8 +64,14 @@ def capture(hwnd, out):
     gdi32.DeleteObject(bmp)
     gdi32.DeleteDC(mem)
     user32.ReleaseDC(hwnd, hdc)
-    Image.frombuffer('RGBA', (w, h), buf, 'raw', 'BGRA', 0, 1).convert('RGB').save(out, optimize=True)
-    return w, h
+    im = Image.frombuffer('RGBA', (w, h), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+    visible = wt.RECT()  # without the invisible resize border that GetWindowRect includes
+    if not ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(visible), ctypes.sizeof(visible)):
+        im = im.crop((visible.left - rect.left, visible.top - rect.top, visible.right - rect.left, visible.bottom - rect.top))
+    if im.width > 800:  # high-DPI screens: the README shows it about 640px wide anyway
+        im = im.resize((800, round(im.height * 800 / im.width)), Image.LANCZOS)
+    im.save(out, 'JPEG', quality=85, optimize=True, progressive=True)
+    return im.size
 
 
 def main():
@@ -74,7 +80,7 @@ def main():
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
     exe = sys.argv[1] if len(sys.argv) > 1 else None
     cmd = [exe] if exe else [sys.executable, os.path.join(ROOT, 'vk_archive_enrich_gui.py')]
-    out = os.path.join(ROOT, 'docs', 'screenshots', 'program.png')
+    out = os.path.join(ROOT, 'docs', 'screenshots', 'program.jpg')
     os.makedirs(os.path.dirname(out), exist_ok=True)
     env = dict(os.environ, VK_ARCHIVE_ENRICH_DEMO='1', VK_ARCHIVE_ENRICH_SELFTEST='9000')
     proc = subprocess.Popen(cmd, env=env)

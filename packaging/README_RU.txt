@@ -17,7 +17,9 @@
 CHROME, EDGE, ЯНДЕКС БРАУЗЕР
 
 Эти браузеры не дают другим программам читать свои cookies. Есть два способа:
- - поставьте расширение «Get cookies.txt LOCALLY», откройте vk.ru, нажмите
+ - поставьте расширение «Get cookies.txt LOCALLY»
+   (https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc),
+   откройте vk.ru, нажмите
    Export All Cookies и укажите полученный файл в окне программы (после работы
    удалите файл: в нём ваши сессии);
  - или выберите вход по токену и нажмите «Как получить?», там пошаговая инструкция.
