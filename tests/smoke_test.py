@@ -82,7 +82,9 @@ def make_archive(root):
                                                                '<div class="page_content clear_fix"><div class="menu">', 1))
     write(root, 'style.css', 'body{font-family:sans-serif}')
     write(root, 'profile/friends0.html', page(1, 'Друзья', '<div class="item">\n  <div class=\'item__main\'>'
-                                                          '<a href="https://vk.ru/id2">Тест Тестов</a></div>\n</div>'))
+                                                          '<a href="https://vk.ru/id2">Тест Тестов</a></div>\n</div>'
+                                                          '<div class="item">\n  <div class=\'item__main\'>'
+                                                          '<a href="https://vk.ru/id3">DELETED</a></div>\n</div>'))
     write(root, 'profile/subscriptions0.html', page(1, 'Подписки', '<div class="nothing-found-stub">\n'
                                                                   '  <div class="nothing-found-stub__text">Пусто</div>\n</div>'))
     write(root, 'messages/index-messages.html', page(1, 'Сообщения', '<div class="item">\n  <div class=\'item__main\'>'
@@ -200,6 +202,7 @@ def main():
         ok.append(check('Привет, как дела?' in read('search/2.js'), 'search data'))
         ok.append(check('EXSTATS' in read('messages/2/stats.html') and 'EXSTATS' in read('messages/stats.html'), 'statistics pages'))
         ok.append(check(os.path.exists(os.path.join(dst, 'enrich.css')), 'assets copied'))
+        ok.append(check('DELETED (id3)</a>' in read('profile/friends0.html'), 'deleted accounts shown with their id'))
         ok.append(check(read('photos/photo-albums/-6.html').count('<div class="item">') == 120, 'an album of 120 photos on one page'))
 
         def conv_pages():

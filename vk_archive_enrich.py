@@ -608,7 +608,7 @@ class Archive:
                 k = chunk.find('<div class="kludges">', he)
                 text = html_text(chunk[he:k if k >= 0 else len(chunk)])
                 if not text and k >= 0 and 'im_srv_lnk' in chunk[k:k + 2000]:
-                    text = html_text(chunk[k:div_end(chunk, k)])  # service message ("X invited Y")
+                    text = html_text(name_deleted(chunk[k:div_end(chunk, k)]))  # service message ("X invited Y")
                 conv.msgs.append((mid, header_lts(hdr), author, pi, 'class="attachment"' in chunk, text))
         conv.src_pages = list(conv.pages)
         self.convs[peer] = conv
@@ -1146,6 +1146,25 @@ def collect_people(obj, out):
 # people: users, groups, chats
 # ----------------------------------------------------------------------------
 
+def shown_name(name, i):
+    """VK names every deleted account and community just "DELETED": add the id so they can be told apart."""
+    tag = 'id%d' % i if i > 0 else 'club%d' % -i
+    if not name:
+        return tag
+    return '%s (%s)' % (name, tag) if name == 'DELETED' else name
+
+
+DELETED_LINK = re.compile(r'''(<a\b[^>]*?href=["']https?://vk\.(?:ru|com)/(id|club|public|event)(\d+)["'][^>]*>)\s*DELETED\s*</a>''')
+
+
+def name_deleted(fragment):
+    """The archive's links to deleted accounts (message headers, lists, service messages), with the id added."""
+    if 'DELETED' not in fragment:
+        return fragment
+    return DELETED_LINK.sub(lambda m: '%s%s</a>' % (m.group(1), shown_name('DELETED', int(m.group(3)) * (1 if m.group(2) == 'id' else -1))),
+                            fragment)
+
+
 class People:
     def __init__(self, dst):
         self.path = os.path.join(dst, '_data', 'people.json')
@@ -1191,9 +1210,9 @@ class People:
             return (c.get('chat_settings') or {}).get('title') or 'Беседа %d' % (i - 2000000000)
         if i > 0:
             u = self.users.get(i)
-            return ('%s %s' % (u.get('first_name', ''), u.get('last_name', ''))).strip() if u else 'id%d' % i
+            return shown_name(('%s %s' % (u.get('first_name', ''), u.get('last_name', ''))).strip() if u else '', i)
         g = self.groups.get(-i)
-        return g.get('name') if g else 'club%d' % -i
+        return shown_name(g.get('name') if g else '', i)
 
     def link(self, i):
         if i is None or i >= 2000000000:
@@ -2165,6 +2184,7 @@ class Enricher:
             t = t.replace('<meta charset="utf-8">', '<meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">', 1)
         t = t.replace('<body>', '<body data-root="%s">' % p, 1)
         t = t.replace('<div class="top_home_logo"></div>', '<a class="ex-home" href="%sindex.html" title="На главную"><div class="top_home_logo"></div></a>' % p, 1)
+        t = name_deleted(t)
 
         def vk_obj(m):
             q, kind, key = m.group(1), m.group(2), m.group(3)
@@ -2248,7 +2268,10 @@ class Enricher:
 
     def peer_name(self, peer):
         known = peer in self.people.users or -peer in self.people.groups or peer in self.people.chats
-        return self.people.name(peer) if known else (self.archive_names.get(peer) or self.people.name(peer))
+        name = None if known else self.archive_names.get(peer)
+        if not name:
+            return self.people.name(peer)
+        return shown_name(name, peer) if peer < 2000000000 else name
 
     def media_line(self, media, sep=' · '):
         return sep.join(nplural(media[t], forms) for t, forms in MEDIA_COUNTED if media.get(t))
@@ -2332,6 +2355,8 @@ class Enricher:
     def render_message_page(self, rel, t, peer, pi, api, lts_of, bar):
         self.r.p = '../../'
         t = self.tx_messages(t, peer, api, lts_of)
+        if peer < 2000000000:  # the title of a conversation with a deleted account
+            t = re.sub(r'(<div class="ui_crumb" >)\s*DELETED\s*(</div>)', lambda m: m.group(1) + shown_name('DELETED', peer) + m.group(2), t, count=1)
         t = self.with_pager(t, self.pager(self.src.convs[peer].pages, pi, 'messages'), bar)
         t = t.replace('</body>', '<script src="nav.js"></script>\n</body>', 1)
         self.finish(rel, t)
