@@ -385,6 +385,10 @@ class App:
             self.determinate(100)
             self.status.set('Готово! Нажмите «Открыть результат».')
             self.root.bell()
+        elif code == 3:  # finished, but some parts failed (ERROR lines in the log)
+            self.determinate(100)
+            self.status.set('Готово, но с ошибками (строки ERROR в журнале). Нажмите «Открыть результат».')
+            self.root.bell()
         else:
             self.determinate(0)
             self.status.set('Остановлено (код %s). Запустите снова — скачанное сохранится, работа продолжится.' % code)

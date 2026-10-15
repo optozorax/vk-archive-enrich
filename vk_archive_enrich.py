@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,7 @@ except ImportError:
     sys.exit('This script needs the "requests" package: pip install requests')
 
 __version__ = '1.1.0'
+REPO = 'https://github.com/optozorax/vk-archive-enrich'
 API_VERSION = '5.199'
 WEB_APP_ID = '6287487'  # app id of the vk.ru web client; its token can read messages
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'
@@ -527,17 +529,17 @@ class Archive:
         return [subdir + '/' + f for f in sorted(names, key=page_num)]
 
     def series(self, rel):
-        """All pages of the paginated list `rel` belongs to, in order."""
+        """All pages of the paginated list `rel` belongs to, in order (none if the export has no such list)."""
         d, prefix, _ = series_key(rel)
         full = self.path(d)
         if not os.path.isdir(full):
-            return [rel]
+            return [rel] if self.exists(rel) else []
         out = []
         for f in os.listdir(full):
             k = series_key(d + '/' + f) if f.endswith('.html') else None
             if k and k[1] == prefix:
                 out.append((k[2], (d + '/' + f).lstrip('/')))
-        return [r for _, r in sorted(out)] or [rel]
+        return [r for _, r in sorted(out)] or ([rel] if self.exists(rel) else [])
 
     def items(self, rel):
         if rel not in self._items:
@@ -593,7 +595,8 @@ class Archive:
     def find_links(self, rels, rx):
         out = []
         for rel in rels:
-            out += re.findall(rx, read_page(self.path(rel)))
+            if self.exists(rel):
+                out += re.findall(rx, read_page(self.path(rel)))
         return out
 
 
@@ -1639,7 +1642,7 @@ class Enricher:
             sys.exit('Destination must differ from the source archive')
         os.makedirs(os.path.join(self.dst, '_data'), exist_ok=True)
         self.data = lambda *p: os.path.join(self.dst, '_data', *p)
-        self.self_id = self.src.self_id
+        self.self_id = self.src.self_id or load_json(self.data('meta.json'), {}).get('self_id')
         self.api = None
         self.cookies = []
         self.tmpdir = tempfile.mkdtemp(prefix='vk_archive_enrich_')
@@ -1657,6 +1660,22 @@ class Enricher:
         self.support = {}
         self.likes = {k: {} for k in LIKE_KINDS}
         self._counts = {}
+        self.errors = []  # (what, error) of parts that failed; the run goes on without them
+        self._seen_errors = set()
+
+    def guard(self, what, fn, *args):
+        """Run one part of the work; if it fails, log why and carry on with the others."""
+        try:
+            return fn(*args)
+        except Exception as e:  # not KeyboardInterrupt / SystemExit: those stop the run
+            err = '%s: %s' % (type(e).__name__, e)
+            self.errors.append((what, err))
+            key = (type(e).__name__, tuple((f.filename, f.lineno) for f in traceback.extract_tb(e.__traceback__)))
+            if key in self._seen_errors:  # the same bug again: one line is enough
+                log('ERROR in %s, skipping it and going on: %s (same place as above)' % (what, err))
+            else:
+                self._seen_errors.add(key)
+                log('ERROR in %s, skipping it and going on:\n%s' % (what, traceback.format_exc().rstrip()))
 
     def online(self, section):
         return self.api is not None and section in self.sections
@@ -1701,44 +1720,48 @@ class Enricher:
     def scan(self):
         t0 = time.time()
         for peer in self.peers:
-            self.src.scan_peer(peer)
+            if self.guard('conversation %d' % peer, self.src.scan_peer, peer) is None:  # its pages are copied as they are
+                conv = self.src.convs[peer] = Conv(peer)
+                conv.pages = [os.path.basename(r) for r in self.src.pages('messages/%d' % peer, r'messages\d+\.html$')]
         log('Archive: %d conversations, %d messages (read in %.0fs)' % (
             len(self.peers), sum(len(c.msgs) for c in self.src.convs.values()), time.time() - t0))
 
     def do_messages(self):
-        fetch = self.online('messages')
-        if fetch:
-            log('Messages: fetching attachments of %d conversations' % len(self.fetch_peers & set(self.peers)))
-        todo = [p for p in self.peers if p in self.fetch_peers]
-        for n, peer in enumerate(self.peers, 1):
-            path = self.data('messages', '%d.json' % peer)
-            conv = self.src.convs[peer]
-            if not fetch or peer not in self.fetch_peers:
-                self.msgs[peer] = {int(k): v for k, v in load_json(path, {}).get('items', {}).items()}
-                continue
-            ids = [m[0] for m in conv.msgs if m[4] or self.a.all_messages]
-            got = {}
-            for group in chunks(list(chunks(ids, 100)), 10):
-                res = self.api.execute([('messages.getById', {'message_ids': ','.join(map(str, c))}) for c in group])
-                for r in res:
-                    for m in (r or {}).get('items', []):
-                        got[m['id']] = m
-            save_json(path, {'peer': peer, 'fetched': int(time.time()), 'requested': len(ids), 'items': got})
-            self.msgs[peer] = got
-            self.stats['messages requested'] += len(ids)
-            self.stats['messages returned by API'] += len(got)
-            for mid, lts, *_ in conv.msgs:  # learn the archive's timezone
-                if lts and mid in got and sum(self.tz_votes.values()) < 20000:
-                    self.tz_votes[round((lts - got[mid]['date']) / 900) * 900] += 1
-            for m in got.values():
-                for a in iter_atts(m):
-                    self.want.attachment(a)
-            missing = {m[0] for m in conv.msgs if m[4] and m[0] not in got}
-            if missing:
-                self.want_archive_fallback(peer, missing)
-            log('[%d/%d] peer %d: %d/%d messages from API, %d new files queued' % (
-                todo.index(peer) + 1, len(todo), peer, len(got), len(ids), len(self.media.pending)))
-            self.flush('peer %d' % peer)
+        todo = [p for p in self.peers if p in self.fetch_peers] if self.online('messages') else []
+        if todo:
+            log('Messages: fetching attachments of %d conversations' % len(todo))
+        for n, peer in enumerate(todo, 1):
+            self.guard('conversation %d' % peer, self.fetch_messages, peer, n, len(todo))
+        for peer in self.peers:  # not fetched this time (or failed): what earlier runs saved
+            if peer not in self.msgs:
+                self.msgs[peer] = {int(k): v for k, v in load_json(self.data('messages', '%d.json' % peer), {}).get('items', {}).items()}
+
+    def fetch_messages(self, peer, n, total):
+        path = self.data('messages', '%d.json' % peer)
+        conv = self.src.convs[peer]
+        ids = [m[0] for m in conv.msgs if m[4] or self.a.all_messages]
+        got = {}
+        for group in chunks(list(chunks(ids, 100)), 10):
+            res = self.api.execute([('messages.getById', {'message_ids': ','.join(map(str, c))}) for c in group])
+            for r in res:
+                for m in (r or {}).get('items', []):
+                    got[m['id']] = m
+        save_json(path, {'peer': peer, 'fetched': int(time.time()), 'requested': len(ids), 'items': got})
+        self.msgs[peer] = got
+        self.stats['messages requested'] += len(ids)
+        self.stats['messages returned by API'] += len(got)
+        for mid, lts, *_ in conv.msgs:  # learn the archive's timezone
+            if lts and mid in got and sum(self.tz_votes.values()) < 20000:
+                self.tz_votes[round((lts - got[mid]['date']) / 900) * 900] += 1
+        for m in got.values():
+            for a in iter_atts(m):
+                self.want.attachment(a)
+        missing = {m[0] for m in conv.msgs if m[4] and m[0] not in got}
+        if missing:
+            self.want_archive_fallback(peer, missing)
+        log('[%d/%d] peer %d: %d/%d messages from API, %d new files queued' % (
+            n, total, peer, len(got), len(ids), len(self.media.pending)))
+        self.flush('peer %d' % peer)
 
     def want_archive_fallback(self, peer, missing):
         """Messages VK no longer returns: grab photos / voice links the archive itself has."""
@@ -1876,7 +1899,7 @@ class Enricher:
                 self.docs[oid(d)] = d
         except VKError as e:
             log('   docs.get failed:', e)
-        wanted = set(self.src.find_links([r for r in ['profile/documents.html'] if self.src.exists(r)],
+        wanted = set(self.src.find_links(['profile/documents.html'],
                                          r'vk\.(?:ru|com)/doc(-?\d+_\d+)'))
         for part in chunks([k for k in wanted if k not in self.docs], 100):
             try:
@@ -1894,8 +1917,7 @@ class Enricher:
         self.stories = load_json(self.data('stories.json'), {})
         if not self.online('profile'):
             return
-        rels = [r for r in ('profile/gifts.html',) if self.src.exists(r)]
-        for u in self.src.find_links(rels, r'<img src="(https?://[^"]+)"'):
+        for u in self.src.find_links(['profile/gifts.html'], r'<img src="(https?://[^"]+)"'):
             u = html.unescape(u)
             m = re.search(r'/images/gift/(\d+)/\d+\.(png|jpg)', u)
             if m:
@@ -1903,7 +1925,7 @@ class Enricher:
                                 'media/gifts/%s.%s' % m.groups())
             else:
                 self.want.url(u, 'gifts')
-        stories = self.src.find_links([r for r in ('profile/stories.html',) if self.src.exists(r)],
+        stories = self.src.find_links(['profile/stories.html'],
                                       r'vk\.(?:ru|com)/story(-?\d+_\d+)')
         if stories:
             try:
@@ -1919,7 +1941,7 @@ class Enricher:
     def like_refs(self, kind):
         rx = re.compile(LIKE_LINK[kind])
         out = []
-        for rel in self.src.series('likes/%s/likes0.html' % kind) if self.src.exists('likes/%s/likes0.html' % kind) else []:
+        for rel in self.src.series('likes/%s/likes0.html' % kind):
             out += [m for m in rx.finditer(read_page(self.src.path(rel)))]
         return out
 
@@ -1937,20 +1959,7 @@ class Enricher:
         log('Support requests: %d' % len(ids))
         os.makedirs(self.data('support'), exist_ok=True)
         for tid in ids:
-            try:
-                page = self.api.http.get('%s/support?act=show&id=%s' % (VK, tid), timeout=60).text
-            except requests.RequestException as e:
-                log('   support request %s: %s' % (tid, type(e).__name__))
-                continue
-            ticket = parse_ticket(page)
-            if ticket is None:  # deleted or no longer shown: keep what an earlier run saved
-                self.support.setdefault(tid, {'missing': True})
-                continue
-            a = page.rfind('<div', 0, page.find('tickets_header clear_fix'))
-            with open(self.data('support', '%s.html' % tid), 'w', encoding='utf-8') as f:  # VK's own markup, for the record
-                f.write(page[a:page.find('tickets_post_field_wrap', a)])
-            self.support[tid] = ticket
-            time.sleep(0.4)
+            self.guard('support request %s' % tid, self.fetch_ticket, tid)
         save_json(path, self.support)
         for t in self.support.values():
             for r in t.get('replies', []):
@@ -1964,6 +1973,22 @@ class Enricher:
                         self.want.url(img['href'], 'support')
         self.flush('support')
 
+    def fetch_ticket(self, tid):
+        try:
+            page = self.api.http.get('%s/support?act=show&id=%s' % (VK, tid), timeout=60).text
+        except requests.RequestException as e:
+            log('   support request %s: %s' % (tid, type(e).__name__))
+            return
+        ticket = parse_ticket(page)
+        if ticket is None:  # deleted or no longer shown: keep what an earlier run saved
+            self.support.setdefault(tid, {'missing': True})
+            return
+        a = page.rfind('<div', 0, page.find('tickets_header clear_fix'))
+        with open(self.data('support', '%s.html' % tid), 'w', encoding='utf-8') as f:  # VK's own markup, for the record
+            f.write(page[a:page.find('tickets_post_field_wrap', a)])
+        self.support[tid] = ticket
+        time.sleep(0.4)
+
     def do_likes(self):
         path = self.data('likes.json')
         saved = load_json(path, {})
@@ -1972,54 +1997,7 @@ class Enricher:
         if not self.online('likes'):
             return
         for kind in LIKE_KINDS:
-            store = self.likes[kind]
-            refs = {like_key(m): m for m in self.like_refs(kind)}
-            new = sorted(k for k in refs if k not in store)
-            if not refs:
-                continue
-            log('Likes/%s: %d, %d new' % (kind, len(refs), len(new)))
-            calls, keys = [], []
-            if kind in ('photo', 'wall', 'video', 'market'):
-                for part in chunks(new, 100):
-                    keys.append(None)
-                    if kind == 'photo':
-                        calls.append(('photos.getById', {'photos': ','.join(part)}))
-                    elif kind == 'wall':
-                        calls.append(('wall.getById', {'posts': ','.join(part), 'copy_history_depth': 2}))
-                    elif kind == 'video':
-                        calls.append(('video.get', {'videos': ','.join(part), 'count': 200}))
-                    else:
-                        calls.append(('market.getById', {'item_ids': ','.join(part), 'extended': 1}))
-            else:  # one comment per call
-                for k in new:
-                    owner, obj, cid = refs[k].group(1).split('_') + [refs[k].group(2)]
-                    keys.append(k)
-                    if kind == 'wall_reply':
-                        calls.append(('wall.getComment', {'owner_id': int(owner), 'comment_id': int(cid)}))
-                    elif kind == 'photo_comment':
-                        calls.append(('photos.getComments', {'owner_id': int(owner), 'photo_id': int(obj),
-                                                              'start_comment_id': int(cid), 'count': 1}))
-                    elif kind == 'video_comment':
-                        calls.append(('video.getComments', {'owner_id': int(owner), 'video_id': int(obj),
-                                                             'start_comment_id': int(cid), 'count': 1}))
-                    else:
-                        calls.append(('board.getComments', {'group_id': abs(int(owner)), 'topic_id': int(obj),
-                                                             'start_comment_id': int(cid), 'count': 1}))
-            per = 10 if kind == 'wall' else 25
-            for gi, group in enumerate(chunks(calls, per)):
-                for ci, r in enumerate(self.api.execute(group)):
-                    key = keys[gi * per + ci]
-                    items = r.get('items', []) if isinstance(r, dict) else (r or [])
-                    if key is None:
-                        for o in items:
-                            store[oid(o)] = o
-                    elif items and str(items[0].get('id')) == key.rsplit('_', 1)[1]:
-                        store[key] = items[0]
-                    else:
-                        store[key] = {'deleted': True}
-                if gi % 20 == 19:  # progress survives an interruption; the file is big, so not every time
-                    save_json(path, self.likes)
-            save_json(path, self.likes)
+            self.guard('likes/%s' % kind, self.fetch_likes, kind, path)
         for p in self.likes['photo'].values():
             self.want.photo(p)
         for p in self.likes['wall'].values():
@@ -2034,6 +2012,56 @@ class Enricher:
         for m in self.likes['market'].values():
             self.want.url(m.get('thumb_photo'))
         self.flush('likes')
+
+    def fetch_likes(self, kind, path):
+        store = self.likes[kind]
+        refs = {like_key(m): m for m in self.like_refs(kind)}
+        new = sorted(k for k in refs if k not in store)
+        if not refs:
+            return
+        log('Likes/%s: %d, %d new' % (kind, len(refs), len(new)))
+        calls, keys = [], []
+        if kind in ('photo', 'wall', 'video', 'market'):
+            for part in chunks(new, 100):
+                keys.append(None)
+                if kind == 'photo':
+                    calls.append(('photos.getById', {'photos': ','.join(part)}))
+                elif kind == 'wall':
+                    calls.append(('wall.getById', {'posts': ','.join(part), 'copy_history_depth': 2}))
+                elif kind == 'video':
+                    calls.append(('video.get', {'videos': ','.join(part), 'count': 200}))
+                else:
+                    calls.append(('market.getById', {'item_ids': ','.join(part), 'extended': 1}))
+        else:  # one comment per call
+            for k in new:
+                owner, obj, cid = refs[k].group(1).split('_') + [refs[k].group(2)]
+                keys.append(k)
+                if kind == 'wall_reply':
+                    calls.append(('wall.getComment', {'owner_id': int(owner), 'comment_id': int(cid)}))
+                elif kind == 'photo_comment':
+                    calls.append(('photos.getComments', {'owner_id': int(owner), 'photo_id': int(obj),
+                                                          'start_comment_id': int(cid), 'count': 1}))
+                elif kind == 'video_comment':
+                    calls.append(('video.getComments', {'owner_id': int(owner), 'video_id': int(obj),
+                                                         'start_comment_id': int(cid), 'count': 1}))
+                else:
+                    calls.append(('board.getComments', {'group_id': abs(int(owner)), 'topic_id': int(obj),
+                                                         'start_comment_id': int(cid), 'count': 1}))
+        per = 10 if kind == 'wall' else 25
+        for gi, group in enumerate(chunks(calls, per)):
+            for ci, r in enumerate(self.api.execute(group)):
+                key = keys[gi * per + ci]
+                items = r.get('items', []) if isinstance(r, dict) else (r or [])
+                if key is None:
+                    for o in items:
+                        store[oid(o)] = o
+                elif items and str(items[0].get('id')) == key.rsplit('_', 1)[1]:
+                    store[key] = items[0]
+                else:
+                    store[key] = {'deleted': True}
+            if gi % 20 == 19:  # progress survives an interruption; the file is big, so not every time
+                save_json(path, self.likes)
+        save_json(path, self.likes)
 
     # -- phase: render --
     def detect_tz(self):
@@ -2053,16 +2081,26 @@ class Enricher:
                 shutil.copy2(p, os.path.join(self.dst, name))
         for name in ('enrich.css', 'enrich.js'):
             shutil.copy2(os.path.join(HERE, 'assets', name), os.path.join(self.dst, name))
-        self.conv_stats = {peer: self.conversation_stats(peer) for peer in self.peers}
+        self.conv_stats = {}
+        for peer in self.peers:
+            self.conv_stats[peer] = self.guard('statistics of conversation %d' % peer, self.conversation_stats, peer) or {
+                'count': len(self.src.convs[peer].msgs), 'first': 0, 'last': 0, 'media': Counter(), 'mine': 0}
         t0, n = time.time(), 0
         for peer in self.peers:
-            n += self.render_conversation(peer)
+            got = self.guard('conversation %d' % peer, self.render_conversation, peer)
+            n += got if got is not None else self.copy_as_is(['messages/%d/%s' % (peer, f) for f in self.src.convs[peer].pages])
         log('   conversations: %d pages in %.0fs' % (n, time.time() - t0))
         n = self.render_other_pages()
-        self.write_messages_index()
-        self.write_search()
+        self.guard('the list of conversations', self.write_messages_index)
+        self.guard('search', self.write_search)
         self.write_report()
         log('Rendered %d other pages' % n)
+
+    def copy_as_is(self, rels):
+        """Pages that failed to render: the archive's own version, still readable."""
+        for rel in rels:
+            self.finish(rel, read_page(self.src.path(rel)))
+        return len(rels)
 
     def finish(self, rel, t):
         depth = rel.count('/')
@@ -2211,15 +2249,21 @@ class Enricher:
         self.r.p = '../../'
         bar = self.conv_bar(peer)
         for pi, name in enumerate(conv.pages):
-            t = read_page(self.src.path('messages', str(peer), name))
-            t = self.tx_messages(t, peer, api, lts_of)
-            t = self.with_pager(t, self.pager(conv.pages, pi, 'messages'), bar)
-            t = t.replace('</body>', '<script src="nav.js"></script>\n</body>', 1)
-            self.finish('messages/%d/%s' % (peer, name), t)
-        self.write_gallery(peer)
+            rel = 'messages/%d/%s' % (peer, name)
+            if self.guard('page ' + rel, self.render_message_page, rel, peer, pi, api, lts_of, bar) is None:
+                self.copy_as_is([rel])
+        self.guard('media of conversation %d' % peer, self.write_gallery, peer)
         if self.a.github_activity:
-            self.write_stats(peer)
+            self.guard('statistics of conversation %d' % peer, self.write_stats, peer)
         return len(conv.pages)
+
+    def render_message_page(self, rel, peer, pi, api, lts_of, bar):
+        self.r.p = '../../'
+        t = self.tx_messages(read_page(self.src.path(rel)), peer, api, lts_of)
+        t = self.with_pager(t, self.pager(self.src.convs[peer].pages, pi, 'messages'), bar)
+        t = t.replace('</body>', '<script src="nav.js"></script>\n</body>', 1)
+        self.finish(rel, t)
+        return True
 
     def tx_messages(self, t, peer, api, lts_of):
         parts = MSG_SPLIT.split(t)
@@ -2496,20 +2540,21 @@ class Enricher:
                 continue
             series = self.src.series(rel)
             done.update(series)
-            heavy = len(series) and max(self.src.items(s) for s in series) > 100
-            if heavy:
-                n += self.repaginate(series)
-                continue
-            for i, s in enumerate(series):
-                depth = s.count('/')
-                self.r.p = '../' * depth
-                t = self.transform(s, read_page(self.src.path(s)))
-                if len(series) > 1:
-                    t = self.with_pager(t, self.pager([x.rsplit('/', 1)[-1] for x in series], i))
-                t = self.annotate(s, t)
-                self.finish(s, t)
-                n += 1
+            got = self.guard('page %s' % rel, self.render_series, series)
+            n += got if got is not None else self.copy_as_is(series)
         return n
+
+    def render_series(self, series):
+        if max(self.src.items(s) for s in series) > 100:
+            return self.repaginate(series)
+        for i, s in enumerate(series):
+            self.r.p = '../' * s.count('/')
+            t = self.transform(s, read_page(self.src.path(s)))
+            if len(series) > 1:
+                t = self.with_pager(t, self.pager([x.rsplit('/', 1)[-1] for x in series], i))
+            t = self.annotate(s, t)
+            self.finish(s, t)
+        return len(series)
 
     def repaginate(self, series, size=50):
         """Lists with 1000 items per page (likes) become pages of `size` items with a proper pager."""
@@ -2771,7 +2816,7 @@ class Enricher:
         saved = self.r.p
         for tid, ticket in self.support.items():
             if ticket.get('replies'):
-                self.write_ticket(tid, ticket)
+                self.guard('support request %s' % tid, self.write_ticket, tid, ticket)
         self.r.p = saved
         return t
 
@@ -2823,11 +2868,17 @@ class Enricher:
                 ('Размер папки media', fmt_size(size))]
         fails = sorted(self.media.failed.items())
         fail_rows = ''.join('<tr><td>%s</td><td>%s</td></tr>' % (esc(k), esc(e)) for k, e in fails[:5000])
-        body = ('<div class="ex-report"><table class="ex-table">%s</table>'
+        errors = ''
+        if self.errors:
+            errors = ('<h3 class="ex-h3">Ошибки</h3><p class="ex-dim">Эти части не получились, остальное сохранено. '
+                      'Если при повторном запуске ошибки не пропадут, пожалуйста, <a href="%s/issues">сообщите о них</a>.</p>'
+                      '<table class="ex-table">%s</table>') % (REPO, ''.join(
+                          '<tr><td>%s</td><td>%s</td></tr>' % (esc(w), esc(e)) for w, e in self.errors[:1000]))
+        body = ('<div class="ex-report"><table class="ex-table">%s</table>%s'
                 '<h3 class="ex-h3">Файлы</h3><table class="ex-table"><tr><th>Тип</th><th>Скачано</th><th>Не удалось</th><th>Пропущено</th></tr>%s</table>'
                 '<p class="ex-dim">Исходные ответы VK API лежат в папке <code>_data</code>. Повторный запуск скрипта докачает то, что не получилось.</p>'
                 '<h3 class="ex-h3">Не скачалось <span class="ex-dim">%s</span></h3><table class="ex-table">%s</table></div>') % (
-            ''.join('<tr><td>%s</td><td>%s</td></tr>' % (esc(a), b) for a, b in info), rows, num(len(fails)), fail_rows)
+            ''.join('<tr><td>%s</td><td>%s</td></tr>' % (esc(a), b) for a, b in info), errors, rows, num(len(fails)), fail_rows)
         self.write_page('enrich-report.html', self.crumbs([('Что скачано', None)]), body)
 
     # -- main --
@@ -2835,15 +2886,10 @@ class Enricher:
         self.connect()
         try:
             self.scan()
-            self.do_messages()
-            self.do_wall()
-            self.do_my_comments()
-            self.do_photos()
-            self.do_docs()
-            self.do_profile()
-            self.do_support()
-            self.do_likes()
-            self.do_people()
+            for what, fn in (('messages', self.do_messages), ('wall', self.do_wall), ('comments', self.do_my_comments),
+                             ('albums', self.do_photos), ('docs', self.do_docs), ('profile', self.do_profile),
+                             ('support', self.do_support), ('likes', self.do_likes), ('people', self.do_people)):
+                self.guard(what, fn)
             if self.api:
                 log('Waiting for the remaining downloads')
                 self.media.wait()
@@ -2856,7 +2902,15 @@ class Enricher:
         st = self.media.stats
         if st:
             log('Downloads: %s' % ', '.join('%s: %d' % kv for kv in sorted(st.items())))
+        if self.errors:
+            parts = [w for w, _ in self.errors]
+            log('Done, but with errors in: %s%s. Everything else is saved; a rerun continues where it stopped. '
+                'If the errors repeat, please report them with the lines starting with ERROR: %s/issues' % (
+                    ', '.join(parts[:5]), ' and %d more' % (len(parts) - 5) if len(parts) > 5 else '', REPO))
+            log('Open %s' % os.path.join(self.dst, 'index.html'))
+            return 3
         log('Done. Open %s' % os.path.join(self.dst, 'index.html'))
+        return 0
 
 
 # menu icons (Material Icons, Apache 2.0), drawn in VK's grey like the archive's own icons
@@ -2972,10 +3026,11 @@ def main():
         log('note: ffmpeg not found - music tracks will not be downloaded')
         args.no_media.append('music')
     try:
-        Enricher(args).run()
+        code = Enricher(args).run()
     except KeyboardInterrupt:
         log('Interrupted - progress is saved, rerun to continue.')
         os._exit(130)  # don't wait for download threads still busy with a big file
+    sys.exit(code)
 
 
 if __name__ == '__main__':

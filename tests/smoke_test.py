@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Smoke test: builds a tiny fake VK archive (same markup and cp1251 encoding as the real
-export), runs vk_archive_enrich on it with --offline and checks the result.
+export), runs vk_archive_enrich on it with --offline and checks the result. When testing the
+script itself (not the exe), it also runs it against a stub VK on that archive and on an
+archive that has nothing but index.html, since people export only some sections.
 
     python tests/smoke_test.py                       # the script from this repository
     python tests/smoke_test.py path/to/vk_archive_enrich_cli.exe
@@ -86,6 +88,9 @@ def make_archive(root):
     write(root, 'messages/index-messages.html', page(1, 'Сообщения', '<div class="item">\n  <div class=\'item__main\'>'
                                                                     '<div class="message-peer">\n  <div class="message-peer--id">\n'
                                                                     '    <a href="2/messages0.html">Тест Тестов</a>\n  </div>\n</div></div>\n</div>'))
+    write(root, 'wall/wall0.html', page(1, 'Стена', '<div class="item">\n  <div class=\'item__main\'><div class="post">\n'
+                                                   '  <a class="post__link fl_l" href="https://vk.ru/wall1_5">Запись</a>\n'
+                                                   '  <div class="post__text">Первая запись</div>\n</div></div>\n</div>'))
     pages = {'messages0.html': [message(4, 2, 3, 2, 12, 'Пока!'), message(3, 1, 2, 2, 11, 'Смотри', 'https://sun9-1.userapi.com/x.jpg')],
              'messages50.html': [message(2, 2, 1, 1, 10, 'Привет, как дела?'), message(1, 1, 1, 1, 9, 'Привет!')]}
     pagination = ('<div class="pagination clear_fix">\n  <div class="fl_r">\n'
@@ -93,6 +98,73 @@ def make_archive(root):
                   '<a class="pg_lnk fl_l" href="messages50.html"><div class="pg_in">2</div></a>\n  </div>\n</div>')
     for name, msgs in pages.items():
         write(root, 'messages/2/' + name, page(2, 'Тест Тестов', ''.join(msgs) + pagination))
+
+
+def make_bare_archive(root):
+    """Only the main page: an export where none of the sections was selected."""
+    write(root, 'index.html', page(0, 'Профиль', '<div class="item">\n  <div class=\'item__main\'><div class="index-row">\n'
+                                                 '  <a class="menu__page-link" href="comments/comments.html"><div>Комментарии</div></a>\n'
+                                                 '</div></div>\n</div>'))
+
+
+# The script with VK replaced by a stub that answers everything but knows nothing: every section the
+# archive has goes through the online code, without network or a login.
+STUB_VK = r'''
+import os, sys
+script = sys.argv.pop(1)
+sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+import vk_archive_enrich as m
+
+ME = m.Archive(sys.argv[1]).self_id or 1
+
+
+class Response:
+    text = ''
+
+
+class Session:
+    def get(self, *args, **kwargs):
+        return Response()
+
+
+class StubVK:
+    def __init__(self, cookies, token=None):
+        self.http = Session()
+
+    def refresh(self):
+        pass
+
+    def call(self, method, **params):
+        if method == 'users.get':
+            ids = params['user_ids'].split(',') if 'user_ids' in params else [ME]
+            return [{'id': int(i), 'first_name': 'Тест', 'last_name': 'Тестов'} for i in ids]
+        if method in ('photos.getById', 'docs.getById'):
+            return []
+        return {'items': [], 'count': 0}
+
+    def execute(self, calls):
+        return [None] * len(calls)
+
+
+def broken(*args, **kwargs):
+    raise RuntimeError('broken on purpose by the test')
+
+
+m.VKApi = StubVK
+m.load_cookies = lambda browser, path: ([('.vk.ru', 'remixsid', 'test', '/')], 'the test')
+for name in filter(None, os.environ.get('VKAE_TEST_BREAK', '').split(',')):  # parts that must fail without stopping the run
+    setattr(m.Enricher, name, broken)
+m.main()
+'''
+NO_MEDIA = 'photos,videos,covers,voice,music,docs,stickers,gifts,avatars'
+
+
+def run(cmd, *args, **env):
+    env = dict(os.environ, PYTHONIOENCODING='utf-8', **env)
+    p = subprocess.run(cmd + list(args), capture_output=True, env=env, timeout=300)
+    out = p.stdout.decode('utf-8', 'replace') + p.stderr.decode('utf-8', 'replace')
+    print(out)
+    return p.returncode, out
 
 
 def check(cond, what):
@@ -107,15 +179,14 @@ def main():
         make_archive(sys.argv[2])
         return 0
     cmd = sys.argv[1:] or [sys.executable, os.path.join(HERE, '..', 'vk_archive_enrich.py')]
+    script = cmd[-1] if cmd[-1].endswith('.py') else None
     tmp = tempfile.mkdtemp(prefix='vkae_smoke_')
     try:
         src, dst = os.path.join(tmp, 'Архив'), os.path.join(tmp, 'Архив_enriched')
         make_archive(src)
-        env = dict(os.environ, PYTHONIOENCODING='utf-8')
-        p = subprocess.run(cmd + [src, dst, '--offline', '--github-activity'], capture_output=True, env=env, timeout=300)
-        print(p.stdout.decode('utf-8', 'replace'), p.stderr.decode('utf-8', 'replace'))
+        code, out = run(cmd, src, dst, '--offline', '--github-activity')
         read = lambda rel: open(os.path.join(dst, rel), encoding='utf-8').read() if os.path.exists(os.path.join(dst, rel)) else ''
-        ok = [check(p.returncode == 0, 'exit code 0')]
+        ok = [check(code == 0, 'exit code 0')]
         index, conv, lst = read('index.html'), read('messages/2/messages0.html'), read('messages/index-messages.html')
         ok.append(check('<meta charset="utf-8">' in index and 'enrich.js' in index, 'pages converted to utf-8 with our css/js'))
         ok.append(check('ex-count">1<' in index and 'ex-zero' in index, 'menu shows counts, empty section dimmed'))
@@ -125,6 +196,27 @@ def main():
         ok.append(check('Привет, как дела?' in read('search/2.js'), 'search data'))
         ok.append(check('EXSTATS' in read('messages/2/stats.html') and 'EXSTATS' in read('messages/stats.html'), 'statistics pages'))
         ok.append(check(os.path.exists(os.path.join(dst, 'enrich.css')), 'assets copied'))
+        if script:
+            stub = [sys.executable, '-c', STUB_VK, script]
+            dst = os.path.join(tmp, 'stub_enriched')
+            code, out = run(stub, src, dst, '--likes', '--github-activity', '--no-media', NO_MEDIA)
+            ok.append(check(code == 0 and 'Traceback' not in out, 'online run (stub VK) on an archive without comments, photos, likes'))
+            ok.append(check('Привет, как дела?' in read('messages/2/messages50.html') and 'enrich.js' in read('wall/wall0.html'),
+                            'online run (stub VK) rendered the pages'))
+            dst = os.path.join(tmp, 'broken_enriched')
+            code, out = run(stub, src, dst, '--no-media', NO_MEDIA, VKAE_TEST_BREAK='do_wall,tx_wall')
+            ok.append(check(code == 3 and 'ERROR in wall' in out and 'ERROR in page wall/wall0.html' in out
+                            and 'Первая запись' in read('wall/wall0.html') and 'Привет!' in read('messages/2/messages50.html')
+                            and 'broken on purpose' in read('enrich-report.html'),
+                            'a part that fails is reported and skipped, the rest is still built'))
+            bare = os.path.join(tmp, 'bare')
+            make_bare_archive(bare)
+            for mode in (['--offline'], ['--likes', '--no-media', NO_MEDIA]):
+                code, out = run(stub if mode[0] != '--offline' else cmd, bare, bare + '_enriched', '--github-activity', *mode)
+                built = all(os.path.exists(os.path.join(bare + '_enriched', f))
+                            for f in ('index.html', 'search.html', 'enrich-report.html', 'messages/index-messages.html'))
+                ok.append(check(code == 0 and 'Traceback' not in out and built,
+                                'archive with only index.html (%s)' % ('offline' if mode[0] == '--offline' else 'stub VK')))
         print('\nSMOKE TEST %s' % ('PASSED' if all(ok) else 'FAILED'))
         return 0 if all(ok) else 1
     finally:
