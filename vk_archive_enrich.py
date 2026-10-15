@@ -43,7 +43,7 @@ try:
 except ImportError:
     sys.exit('This script needs the "requests" package: pip install requests')
 
-__version__ = '1.1.0'
+__version__ = '1.1.1'
 REPO = 'https://github.com/optozorax/vk-archive-enrich'
 API_VERSION = '5.199'
 WEB_APP_ID = '6287487'  # app id of the vk.ru web client; its token can read messages
