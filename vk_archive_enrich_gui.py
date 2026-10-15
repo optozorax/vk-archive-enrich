@@ -27,6 +27,9 @@ MEDIA = [('photos', 'Фото'), ('videos', 'Видео'), ('covers', 'Обло�
          ('music', 'Музыка'), ('docs', 'Документы'), ('stickers', 'Стикеры'), ('gifts', 'Подарки'),
          ('avatars', 'Аватарки')]
 QUALITY = ['360', '480', '720', '1080', '1440', '2160']
+AS_ARCHIVE, ALL_ON_ONE = 'как в архиве', 'все на одной'
+PER_PAGE = [AS_ARCHIVE, '20', '50', '100', '200', '500', '1000', '5000', ALL_ON_ONE]
+SEARCH_RESULTS = ['50', '100', '200', '500', '1000', 'все сразу']
 MAX_LOG_LINES = 5000
 
 
@@ -40,6 +43,16 @@ def worker_command():
     if core.FROZEN:
         return [os.path.join(os.path.dirname(sys.executable), 'vk_archive_enrich_cli.exe')]
     return [sys.executable, '-u', os.path.abspath(core.__file__)]
+
+
+def page_size(text):
+    """A page size field as a command line value: None for "as in the archive", '0' for "all", False if it is no number."""
+    text = text.strip().lower().replace(' ', '')
+    if not text or text == AS_ARCHIVE.replace(' ', ''):
+        return None
+    if text.startswith('все'):
+        return '0'
+    return text if text.isdigit() else False
 
 
 def open_path(path):
@@ -112,6 +125,9 @@ class App:
         self.activity = tk.BooleanVar(value=True)
         self.quality = tk.StringVar(value='1080')
         self.offline = tk.BooleanVar(value=False)
+        self.msgs_per_page = tk.StringVar(value=AS_ARCHIVE)
+        self.items_per_page = tk.StringVar(value=AS_ARCHIVE)
+        self.search_results = tk.StringVar(value='100')
         self.status = tk.StringVar(value='Выберите папку с архивом VK и нажмите «Начать».')
         self.load_settings()
         self.build()
@@ -171,8 +187,21 @@ class App:
         ttk.Combobox(box, textvariable=self.quality, values=QUALITY, width=6, state='readonly').grid(row=0, column=2, sticky='w')
         ttk.Checkbutton(box, text='Только пересобрать страницы', variable=self.offline).grid(row=0, column=3, sticky='w', padx=(24, 0))
 
+        box = ttk.LabelFrame(outer, text='Страницы', padding=10)
+        box.grid(row=4, column=0, sticky='ew', pady=(10, 0))
+        for col, (label, var, values, width) in enumerate([
+                ('Сообщений на странице:', self.msgs_per_page, PER_PAGE, 13),
+                ('Записей в списках:', self.items_per_page, PER_PAGE, 13),
+                ('Результатов поиска сразу:', self.search_results, SEARCH_RESULTS, 9)]):
+            ttk.Label(box, text=label).grid(row=0, column=2 * col, sticky='w', padx=(0 if col == 0 else 18, 4))
+            ttk.Combobox(box, textvariable=var, values=values, width=width).grid(row=0, column=2 * col + 1, sticky='w')
+        hint = ttk.Label(box, foreground='#6d7885', justify='left', text='Можно вписать своё число. Списки: стена, комментарии, '
+                         'лайки, друзья. Для уже готового архива хватит «Только пересобрать страницы».')
+        hint.grid(row=1, column=0, columnspan=6, sticky='ew', pady=(4, 0))
+        hint.bind('<Configure>', lambda e: hint.configure(wraplength=e.width))
+
         bar = ttk.Frame(outer)
-        bar.grid(row=4, column=0, sticky='ew', pady=(12, 0))
+        bar.grid(row=5, column=0, sticky='ew', pady=(12, 0))
         self.btn_start = ttk.Button(bar, text='Начать', command=self.start)
         self.btn_start.pack(side='left')
         self.btn_stop = ttk.Button(bar, text='Стоп', command=self.stop, state='disabled')
@@ -183,13 +212,13 @@ class App:
         ttk.Button(bar, text='Справка', command=lambda: webbrowser.open(REPO + '#readme')).pack(side='right')
 
         self.progress = ttk.Progressbar(outer, mode='determinate', maximum=100)
-        self.progress.grid(row=5, column=0, sticky='ew', pady=(10, 2))
-        ttk.Label(outer, textvariable=self.status).grid(row=6, column=0, sticky='w')
+        self.progress.grid(row=6, column=0, sticky='ew', pady=(10, 2))
+        ttk.Label(outer, textvariable=self.status).grid(row=7, column=0, sticky='w')
 
         mono = tkfont.Font(family='Consolas' if os.name == 'nt' else 'monospace', size=9)
         self.log = ScrolledText(outer, height=7, font=mono, wrap='word', state='disabled', background='#fbfbfc')
-        self.log.grid(row=7, column=0, sticky='nsew', pady=(8, 0))
-        outer.rowconfigure(7, weight=1)
+        self.log.grid(row=8, column=0, sticky='nsew', pady=(8, 0))
+        outer.rowconfigure(8, weight=1)
 
     # -- pickers --
     def pick_src(self):
@@ -228,7 +257,7 @@ class App:
                 s = json.load(f)
         except (OSError, ValueError):
             return
-        for name in ('src', 'dst', 'login', 'cookies', 'quality'):
+        for name in ('src', 'dst', 'login', 'cookies', 'quality', 'msgs_per_page', 'items_per_page', 'search_results'):
             if isinstance(s.get(name), str):
                 getattr(self, name).set(s[name])
         for name in ('activity', 'offline'):
@@ -243,7 +272,8 @@ class App:
         self.dst_auto = self.src.get().rstrip('\\/') + '_enriched' if self.src.get() else ''
 
     def save_settings(self):  # the token is deliberately not saved
-        s = {name: getattr(self, name).get() for name in ('src', 'dst', 'login', 'cookies', 'quality', 'activity', 'offline')}
+        s = {name: getattr(self, name).get() for name in ('src', 'dst', 'login', 'cookies', 'quality', 'activity', 'offline',
+                                                          'msgs_per_page', 'items_per_page', 'search_results')}
         s['sections'] = {k: v.get() for k, v in self.sections.items()}
         s['media'] = {k: v.get() for k, v in self.media.items()}
         try:
@@ -282,6 +312,15 @@ class App:
         if self.activity.get():
             args.append('--github-activity')
         args += ['--max-video-height', self.quality.get()]
+        for option, var, what in (('--messages-per-page', self.msgs_per_page, 'Сообщений на странице'),
+                                  ('--items-per-page', self.items_per_page, 'Записей в списках'),
+                                  ('--search-results', self.search_results, 'Результатов поиска сразу')):
+            value = page_size(var.get())
+            if value is False:
+                messagebox.showerror(APP, '«%s»: впишите число или выберите из списка.' % what)
+                return None
+            if value is not None:
+                args += [option, value]
         return worker_command() + args
 
     def start(self):

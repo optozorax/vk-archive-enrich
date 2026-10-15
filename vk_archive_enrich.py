@@ -43,7 +43,7 @@ try:
 except ImportError:
     sys.exit('This script needs the "requests" package: pip install requests')
 
-__version__ = '1.1.1'
+__version__ = '1.2.0'
 REPO = 'https://github.com/optozorax/vk-archive-enrich'
 API_VERSION = '5.199'
 WEB_APP_ID = '6287487'  # app id of the vk.ru web client; its token can read messages
@@ -473,13 +473,45 @@ def count_items(page_html):
     return page_html.count('<div class="item">')
 
 
+def page_items(page_html):
+    """Every <div class="item"> of a list page, in order."""
+    w = page_html.find('<div class="wrap_page_content">')
+    if w < 0:
+        return []
+    body = page_html[w:div_end(page_html, w)]
+    return [body[a:b] for a, b in div_blocks(body, '<div class="item">')]
+
+
+def page_frame(page_html):
+    """A list page without its items and pagination: (html before the items, html after them)."""
+    p = page_html.find('<div class="pagination')
+    if p >= 0:
+        page_html = page_html[:p] + page_html[div_end(page_html, p):]
+    w = page_html.find('<div class="wrap_page_content">')
+    if w < 0:
+        return None
+    return page_html[:w] + '<div class="wrap_page_content">', '</div>' + page_html[div_end(page_html, w):]
+
+
+def list_names(first, count):
+    """File names for `count` pages of a list: the first keeps its name, the rest are numbered as
+    the archive does it (comments.html, comments2.html...; likes0.html, likes1.html...)."""
+    d, prefix, start = series_key(first)
+    base = first.rsplit('/', 1)[-1]
+    if prefix[-1:].isdigit():  # "-6.html": a name, not a page number
+        return [base] + ['%s_%d.html' % (base[:-5], k + 1) for k in range(1, count)]
+    return [base] + ['%s%d.html' % (prefix, start + k) for k in range(1, count)]
+
+
 class Conv:
     """One conversation as the archive has it. msgs: newest first, as on the pages:
     (id, local time, author id, page index, has attachments, text)."""
 
     def __init__(self, peer):
         self.peer = peer
-        self.pages = []  # file names, newest first
+        self.pages = []  # file names of the pages we write, newest first
+        self.src_pages = []  # the archive's pages; differ from `pages` when regrouped (--messages-per-page)
+        self.per_page = 0  # messages per page when regrouped, else 0
         self.msgs = []
         self.name = ''
 
@@ -578,6 +610,7 @@ class Archive:
                 if not text and k >= 0 and 'im_srv_lnk' in chunk[k:k + 2000]:
                     text = html_text(chunk[k:div_end(chunk, k)])  # service message ("X invited Y")
                 conv.msgs.append((mid, header_lts(hdr), author, pi, 'class="attachment"' in chunk, text))
+        conv.src_pages = list(conv.pages)
         self.convs[peer] = conv
         return conv
 
@@ -1720,11 +1753,22 @@ class Enricher:
     def scan(self):
         t0 = time.time()
         for peer in self.peers:
-            if self.guard('conversation %d' % peer, self.src.scan_peer, peer) is None:  # its pages are copied as they are
+            conv = self.guard('conversation %d' % peer, self.src.scan_peer, peer)
+            if conv is None:  # its pages are copied as they are
                 conv = self.src.convs[peer] = Conv(peer)
                 conv.pages = [os.path.basename(r) for r in self.src.pages('messages/%d' % peer, r'messages\d+\.html$')]
+                conv.src_pages = list(conv.pages)
+            elif self.a.messages_per_page is not None and conv.msgs:
+                self.regroup(conv, self.a.messages_per_page or len(conv.msgs))
         log('Archive: %d conversations, %d messages (read in %.0fs)' % (
             len(self.peers), sum(len(c.msgs) for c in self.src.convs.values()), time.time() - t0))
+
+    @staticmethod
+    def regroup(conv, n):
+        """Pages of n messages instead of the archive's 50, named the same way (messages0.html, messages<n>.html...)."""
+        conv.per_page = n
+        conv.pages = ['messages%d.html' % (k * n) for k in range((len(conv.msgs) + n - 1) // n)]
+        conv.msgs = [m[:3] + (i // n,) + m[4:] for i, m in enumerate(conv.msgs)]
 
     def do_messages(self):
         todo = [p for p in self.peers if p in self.fetch_peers] if self.online('messages') else []
@@ -1765,7 +1809,7 @@ class Enricher:
 
     def want_archive_fallback(self, peer, missing):
         """Messages VK no longer returns: grab photos / voice links the archive itself has."""
-        for name in self.src.convs[peer].pages:
+        for name in self.src.convs[peer].src_pages:
             parts = MSG_SPLIT.split(read_page(self.src.path('messages', str(peer), name)))
             for i in range(1, len(parts), 2):
                 if int(parts[i]) in missing:
@@ -2088,7 +2132,7 @@ class Enricher:
         t0, n = time.time(), 0
         for peer in self.peers:
             got = self.guard('conversation %d' % peer, self.render_conversation, peer)
-            n += got if got is not None else self.copy_as_is(['messages/%d/%s' % (peer, f) for f in self.src.convs[peer].pages])
+            n += got if got is not None else self.copy_as_is(['messages/%d/%s' % (peer, f) for f in self.src.convs[peer].src_pages])
         log('   conversations: %d pages in %.0fs' % (n, time.time() - t0))
         n = self.render_other_pages()
         self.guard('the list of conversations', self.write_messages_index)
@@ -2246,20 +2290,48 @@ class Enricher:
         with open(os.path.join(folder, 'nav.js'), 'w', encoding='utf-8') as f:
             f.write('window.EXNAV=%s;\n' % json.dumps({'peer': peer, 'files': conv.pages, 'newest': [x[0] for x in ranges],
                                                        'oldest': [x[1] for x in ranges]}))
+        for f in os.listdir(folder):  # pages left from a run with another --messages-per-page
+            if re.fullmatch(r'messages\d+\.html', f) and f not in conv.pages:
+                os.remove(os.path.join(folder, f))
         self.r.p = '../../'
         bar = self.conv_bar(peer)
-        for pi, name in enumerate(conv.pages):
+        for pi, (name, t) in enumerate(self.message_pages(conv)):
             rel = 'messages/%d/%s' % (peer, name)
-            if self.guard('page ' + rel, self.render_message_page, rel, peer, pi, api, lts_of, bar) is None:
-                self.copy_as_is([rel])
+            if self.guard('page ' + rel, self.render_message_page, rel, t, peer, pi, api, lts_of, bar) is None:
+                self.finish(rel, self.with_pager(t, self.pager(conv.pages, pi, 'messages')))  # plain, as in the archive
         self.guard('media of conversation %d' % peer, self.write_gallery, peer)
         if self.a.github_activity:
             self.guard('statistics of conversation %d' % peer, self.write_stats, peer)
         return len(conv.pages)
 
-    def render_message_page(self, rel, peer, pi, api, lts_of, bar):
+    def message_pages(self, conv):
+        """(file name, html) of each page to write: the archive's pages, or new ones of conv.per_page messages."""
+        def read(name):
+            return read_page(self.src.path('messages', str(conv.peer), name))
+        if not conv.per_page:
+            for name in conv.pages:
+                yield name, read(name)
+            return
+        frame, items, seen, k = None, [], 0, 0
+        for name in conv.src_pages:  # one archive page at a time: a conversation can be gigabytes
+            t = read(name)
+            frame = frame or page_frame(t)
+            for item in page_items(t):
+                c = len(MSG_SPLIT.findall(item))
+                if c and seen >= (k + 1) * conv.per_page and k + 1 < len(conv.pages):
+                    yield conv.pages[k], frame[0] + ''.join(items) + frame[1]
+                    items, k = [], k + 1
+                items.append(item)
+                seen += c
+        if not frame:
+            raise ValueError('no list of messages on the archive pages')
+        for name in conv.pages[k:]:
+            yield name, frame[0] + ''.join(items) + frame[1]
+            items = []
+
+    def render_message_page(self, rel, t, peer, pi, api, lts_of, bar):
         self.r.p = '../../'
-        t = self.tx_messages(read_page(self.src.path(rel)), peer, api, lts_of)
+        t = self.tx_messages(t, peer, api, lts_of)
         t = self.with_pager(t, self.pager(self.src.convs[peer].pages, pi, 'messages'), bar)
         t = t.replace('</body>', '<script src="nav.js"></script>\n</body>', 1)
         self.finish(rel, t)
@@ -2525,10 +2597,10 @@ class Enricher:
             f.write('(window.EXSQ=window.EXSQ||[]).push({init:[%s,%s,%d]});\n' % (
                 json.dumps(peers, ensure_ascii=False), json.dumps({str(k): v for k, v in people.items()}, ensure_ascii=False),
                 self.self_id or 0))
-        body = ('<div id="ex-search"><div class="ex-controls"><input type="search" id="ex-sq" placeholder="Что искать (все слова должны встретиться)" autofocus>'
+        body = ('<div id="ex-search" data-step="%d"><div class="ex-controls"><input type="search" id="ex-sq" placeholder="Что искать (все слова должны встретиться)" autofocus>'
                 '<select id="ex-speer"><option value="">Во всех переписках</option></select>'
                 '<select id="ex-sauthor"><option value="">Все авторы</option><option value="me">Только мои</option><option value="them">Только чужие</option></select></div>'
-                '<div id="ex-sstatus" class="ex-dim">Загрузка…</div><div id="ex-sresults"></div></div>')
+                '<div id="ex-sstatus" class="ex-dim">Загрузка…</div><div id="ex-sresults"></div></div>') % self.a.search_results
         self.write_page('search.html', self.crumbs([('Поиск по сообщениям', None)]), body,
                         '<script src="search/index.js"></script>')
 
@@ -2545,8 +2617,10 @@ class Enricher:
         return n
 
     def render_series(self, series):
-        if max(self.src.items(s) for s in series) > 100:
-            return self.repaginate(series)
+        size = self.list_size(series)
+        if size:
+            return self.repaginate(series, size)
+        self.drop_stale(series[0], [x.rsplit('/', 1)[-1] for x in series])
         for i, s in enumerate(series):
             self.r.p = '../' * s.count('/')
             t = self.transform(s, read_page(self.src.path(s)))
@@ -2556,37 +2630,58 @@ class Enricher:
             self.finish(s, t)
         return len(series)
 
-    def repaginate(self, series, size=50):
-        """Lists with 1000 items per page (likes) become pages of `size` items with a proper pager."""
-        items, template = [], None
+    def list_size(self, series):
+        """Items per page to cut a list into (--items-per-page), or None to keep the archive's pages."""
+        if not self.regroupable(series[0]):
+            return None
+        counts = [self.src.items(s) for s in series]
+        n = self.a.items_per_page
+        if n is None:  # as in the archive, but likes come 1000 per page: those get 50
+            return 50 if max(counts) > 100 else None
+        n = n or sum(counts) or 1
+        if all(c == n for c in counts[:-1]) and counts[-1] <= n and (counts[-1] or len(counts) == 1):
+            return None  # already so (and no empty page at the end)
+        return n
+
+    def regroupable(self, rel):
+        """Lists that may be cut into other pages: not the main page, profile info, menus or albums
+        (a photo album is a grid the photo viewer walks through, better whole)."""
+        if rel in ('index.html', 'profile/page-info.html') or rel.startswith(('photos/photo-albums/', 'video/video-albums/')):
+            return False
+        return self.menu_targets(rel) is None
+
+    def repaginate(self, series, size):
+        """Join the pages of a list and cut them again, `size` items per page, with our pager."""
+        items, frame = [], None
         for rel in series:
             t = read_page(self.src.path(rel))
-            w = t.find('<div class="wrap_page_content">')
-            if w < 0:
-                continue
-            e = div_end(t, w)
-            body = t[w:e]
-            items += [body[a:b] for a, b in div_blocks(body, '<div class="item">')]
-            if template is None:
-                p = t.find('<div class="pagination')
-                if p >= 0:
-                    t = t[:p] + t[div_end(t, p):]
-                    w = t.find('<div class="wrap_page_content">')
-                    e = div_end(t, w)
-                template = t[:w] + '<div class="wrap_page_content">%%ITEMS%%</div>' + t[e:]
-        d, prefix, first = series_key(series[0])
+            items += page_items(t)
+            frame = frame or page_frame(t)
+        if not frame:
+            raise ValueError('no list on the page')
         pages = list(chunks(items, size)) or [[]]
-        names = [('%s.html' % prefix if (k == 0 and first == 1 and not re.search(r'\d\.html$', series[0])) else
-                  '%s%d.html' % (prefix, k + (1 if first == 1 else 0))) for k in range(len(pages))]
+        names = list_names(series[0], len(pages))
+        self.drop_stale(series[0], names)
+        d = series[0].rpartition('/')[0]
         for k, chunk in enumerate(pages):
             rel = (d + '/' if d else '') + names[k]
             self.r.p = '../' * rel.count('/')
-            t = template.replace('%%ITEMS%%', ''.join(chunk))
-            t = self.transform(rel, t)
+            t = self.transform(rel, frame[0] + ''.join(chunk) + frame[1])
             t = self.with_pager(t, self.pager(names, k))
             t = self.annotate(rel, t, series[0])
             self.finish(rel, t)
         return len(pages)
+
+    def drop_stale(self, first, names):
+        """Delete pages of this list that an earlier run with another --items-per-page wrote."""
+        d, prefix, _ = series_key(first)
+        folder = os.path.join(self.dst, d)
+        if not os.path.isdir(folder):
+            return
+        rx = re.escape(prefix) + (r'_\d+\.html' if prefix[-1:].isdigit() else r'\d*\.html')
+        for f in os.listdir(folder):
+            if re.fullmatch(rx, f) and f not in names:
+                os.remove(os.path.join(folder, f))
 
     def transform(self, rel, t):
         parts = rel.split('/')
@@ -2602,11 +2697,11 @@ class Enricher:
             return self.tx_album(t)
         if rel == 'profile/page-info.html':
             return self.tx_page_info(t)
-        if rel == 'profile/gifts.html':
+        if re.fullmatch(r'profile/gifts\d*\.html', rel):  # gifts2.html... with --items-per-page
             return self.tx_gifts(t)
         if parts[0] == 'profile':
             return self.tx_people_list(t)
-        if rel == 'other/support.html':
+        if re.fullmatch(r'other/support\d*\.html', rel):
             return self.tx_support(t)
         if parts[0] == 'likes' and len(parts) == 3:
             return self.tx_likes(t, parts[1])
@@ -2625,16 +2720,8 @@ class Enricher:
         elif rel in ('profile/page-info.html', 'index.html') or not self.src.exists(rel):
             res = None
         else:
-            t = read_page(self.src.path(rel))
-            w = t.find('<div class="wrap_page_content">')
-            body = t[w:div_end(t, w)] if w >= 0 else ''
-            blocks = [body[a:b] for a, b in div_blocks(body, '<div class="item">')]
-            targets = []
-            for b in blocks:
-                hrefs = re.findall(r'href="([^"#?]+\.html)"', b)
-                if len(hrefs) == 1 and 'http' not in b:
-                    targets.append(hrefs[0])
-            if blocks and len(targets) == len(blocks):  # a menu of sub-pages
+            targets = self.menu_targets(rel)
+            if targets is not None:  # a menu of sub-pages
                 d = os.path.dirname(rel)
                 sub = [self.count_of(os.path.join(d, h)) for h in targets]
                 res = sum(x for x in sub if x)
@@ -2642,6 +2729,16 @@ class Enricher:
                 res = sum(self.src.items(s) for s in self.src.series(rel))
         self._counts[rel] = res
         return res
+
+    def menu_targets(self, rel):
+        """The pages a menu page links (each of its items is one link to a page of the archive); None if it is no menu."""
+        blocks = page_items(read_page(self.src.path(rel)))
+        targets = []
+        for b in blocks:
+            hrefs = re.findall(r'href="([^"#?]+\.html)"', b)
+            if len(hrefs) == 1 and 'http' not in b:
+                targets.append(hrefs[0])
+        return targets if blocks and len(targets) == len(blocks) else None
 
     def annotate(self, rel, t, count_rel=None):
         """Badges with item counts on links to other pages, and on the page's own title."""
@@ -2968,7 +3065,8 @@ def main():
                '  python3 vk_archive_enrich.py Archive --likes --github-activity\n'
                '  python3 vk_archive_enrich.py Archive --only messages --no-media videos,music\n'
                '  python3 vk_archive_enrich.py Archive --browser chrome\n'
-               '  python3 vk_archive_enrich.py Archive --offline              # пересобрать страницы без интернета\n')
+               '  python3 vk_archive_enrich.py Archive --offline              # пересобрать страницы без интернета\n'
+               '  python3 vk_archive_enrich.py Archive --offline --messages-per-page 500\n')
     ap.add_argument('--version', action='version', version='vk_archive_enrich %s (ffmpeg: %s)' % (
         __version__, 'found' if FFMPEG else 'not found'))
     ap.add_argument('src', help='распакованный архив VK (папка с index.html)')
@@ -2994,6 +3092,13 @@ def main():
     g = ap.add_argument_group('страницы')
     g.add_argument('--github-activity', action='store_true', help='календарь активности и страницы статистики переписок')
     g.add_argument('--offline', action='store_true', help='без интернета: только пересобрать страницы из сохранённых данных')
+    g.add_argument('--messages-per-page', type=int, metavar='N',
+                   help='сообщений на одной странице переписки (по умолчанию как в архиве: 50; 0 = вся переписка на одной странице)')
+    g.add_argument('--items-per-page', type=int, metavar='N',
+                   help='записей на странице в списках: стена, комментарии, лайки, друзья, документы '
+                        '(по умолчанию как в архиве, лайки по 50; 0 = весь список на одной странице)')
+    g.add_argument('--search-results', type=int, default=100, metavar='N',
+                   help='сколько найденных сообщений поиск показывает сразу, до кнопки «Показать ещё» (100; 0 = все)')
     g.add_argument('--peers', metavar='IDS', help='скачивать только эти переписки (id через запятую), для проверки')
     g = ap.add_argument_group('скорость')
     g.add_argument('--workers', type=int, default=8, help='параллельных загрузок фото и файлов (8)')
@@ -3013,6 +3118,9 @@ def main():
         vk_archive_enrich_gui.main()
         return
     args = ap.parse_args()
+    for name in ('messages_per_page', 'items_per_page', 'search_results'):
+        if (getattr(args, name) or 0) < 0:
+            ap.error('--%s: нужно число 0 или больше' % name.replace('_', '-'))
 
     sections = set(SECTIONS) - {'likes'}
     if args.likes:

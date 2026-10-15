@@ -463,6 +463,8 @@
     var S = {peers: [], names: {}, people: {}, me: 0, data: {}, loaded: 0, wanted: 0};
     var sq = $('#ex-sq'), speer = $('#ex-speer'), sauthor = $('#ex-sauthor'), status = $('#ex-sstatus'), out = $('#ex-sresults');
     var shown = 0, hits = [], words = [], timer = null;
+    var perShow = searchBox.getAttribute('data-step');  // results per "show more" (--search-results; 0 = all)
+    perShow = perShow === null ? 100 : (+perShow || Infinity);
 
     function handle(x) {
       if (x.init) {
@@ -563,7 +565,7 @@
       var old = $('.ex-more', out);
       if (old) old.parentNode.removeChild(old);
       var frag = document.createDocumentFragment();
-      hits.slice(shown, shown + 100).forEach(function (h) {
+      hits.slice(shown, shown + perShow).forEach(function (h) {
         var p = h[0], r = h[1], D = S.data[p], who = S.people[h[2]] || ['id' + h[2], ''];
         var peer = S.names[p] || [p, String(p), ''];
         var link = ROOT + 'messages/' + p + '/' + D.meta.pages[r[2]] + '#m' + r[0];
@@ -578,7 +580,7 @@
         frag.appendChild(div);
       });
       out.appendChild(frag);
-      shown = Math.min(hits.length, shown + 100);
+      shown = Math.min(hits.length, shown + perShow);
       if (shown < hits.length) {
         var b = document.createElement('button');
         b.className = 'ex-btn ex-more';

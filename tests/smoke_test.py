@@ -88,9 +88,13 @@ def make_archive(root):
     write(root, 'messages/index-messages.html', page(1, 'Сообщения', '<div class="item">\n  <div class=\'item__main\'>'
                                                                     '<div class="message-peer">\n  <div class="message-peer--id">\n'
                                                                     '    <a href="2/messages0.html">Тест Тестов</a>\n  </div>\n</div></div>\n</div>'))
-    write(root, 'wall/wall0.html', page(1, 'Стена', '<div class="item">\n  <div class=\'item__main\'><div class="post">\n'
-                                                   '  <a class="post__link fl_l" href="https://vk.ru/wall1_5">Запись</a>\n'
-                                                   '  <div class="post__text">Первая запись</div>\n</div></div>\n</div>'))
+    write(root, 'wall/wall0.html', page(1, 'Стена', ''.join(
+        '<div class="item">\n  <div class=\'item__main\'><div class="post">\n'
+        '  <a class="post__link fl_l" href="https://vk.ru/wall1_%d">Запись</a>\n'
+        '  <div class="post__text">%s запись</div>\n</div></div>\n</div>' % x for x in [(5, 'Первая'), (4, 'Вторая'), (3, 'Третья')])))
+    write(root, 'photos/photo-albums/-6.html', page(2, 'Фотографии со страницы', ''.join(  # an album: a grid, kept whole
+        '<div class="item">\n  <div class=\'item__main\'><a href="https://vk.ru/photo1_%d"><img src="https://sun9-1.userapi.com/%d.jpg" '
+        'alt="1_%d"></a></div>\n</div>' % (i, i, i) for i in range(1, 121))))
     pages = {'messages0.html': [message(4, 2, 3, 2, 12, 'Пока!'), message(3, 1, 2, 2, 11, 'Смотри', 'https://sun9-1.userapi.com/x.jpg')],
              'messages50.html': [message(2, 2, 1, 1, 10, 'Привет, как дела?'), message(1, 1, 1, 1, 9, 'Привет!')]}
     pagination = ('<div class="pagination clear_fix">\n  <div class="fl_r">\n'
@@ -196,6 +200,29 @@ def main():
         ok.append(check('Привет, как дела?' in read('search/2.js'), 'search data'))
         ok.append(check('EXSTATS' in read('messages/2/stats.html') and 'EXSTATS' in read('messages/stats.html'), 'statistics pages'))
         ok.append(check(os.path.exists(os.path.join(dst, 'enrich.css')), 'assets copied'))
+        ok.append(check(read('photos/photo-albums/-6.html').count('<div class="item">') == 120, 'an album of 120 photos on one page'))
+
+        def conv_pages():
+            return sorted(f for f in os.listdir(os.path.join(dst, 'messages', '2')) if f.startswith('messages'))
+        code, out = run(cmd, src, dst, '--offline', '--messages-per-page', '1', '--items-per-page', '2', '--search-results', '7')
+        pages = ['messages%d.html' % i for i in range(4)]
+        ok.append(check(code == 0 and conv_pages() == pages and all(read('messages/2/' + f).count('class="message"') == 1 for f in pages)
+                        and '"files": %s' % json.dumps(pages) in read('messages/2/nav.js') and '"pages": %s' % json.dumps(pages) in read('search/2.js'),
+                        '--messages-per-page 1: a page per message, the archive\'s pages are gone'))
+        ok.append(check(read('wall/wall0.html').count('<div class="item">') == 2 and 'Третья запись' in read('wall/wall1.html')
+                        and 'href="wall1.html"' in read('wall/wall0.html'), '--items-per-page 2: the wall in pages of 2'))
+        ok.append(check(read('photos/photo-albums/-6.html').count('<div class="item">') == 120
+                        and not os.path.exists(os.path.join(dst, 'photos/photo-albums/-6_2.html')), '--items-per-page 2: albums stay whole'))
+        ok.append(check('data-step="7"' in read('search.html'), '--search-results 7'))
+        code, out = run(cmd, src, dst, '--offline', '--messages-per-page', '0', '--items-per-page', '0')
+        ok.append(check(code == 0 and conv_pages() == ['messages0.html'] and read('messages/2/messages0.html').count('class="message"') == 4
+                        and read('wall/wall0.html').count('<div class="item">') == 3 and not read('wall/wall1.html'),
+                        'page size 0: everything on one page'))
+        code, out = run(cmd, src, dst, '--offline')
+        ok.append(check(code == 0 and conv_pages() == ['messages0.html', 'messages50.html'] and 'Привет!' in read('messages/2/messages50.html'),
+                        'no page size: the archive\'s pages again'))
+        code, out = run(cmd, src, dst, '--offline', '--messages-per-page', '-5')
+        ok.append(check(code == 2, 'a negative page size is refused'))
         if script:
             stub = [sys.executable, '-c', STUB_VK, script]
             dst = os.path.join(tmp, 'stub_enriched')
