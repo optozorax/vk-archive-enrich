@@ -11,6 +11,7 @@ archive that has nothing but index.html, since people export only some sections.
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -89,7 +90,10 @@ def make_archive(root):
                                                                   '  <div class="nothing-found-stub__text">Пусто</div>\n</div>'))
     write(root, 'messages/index-messages.html', page(1, 'Сообщения', '<div class="item">\n  <div class=\'item__main\'>'
                                                                     '<div class="message-peer">\n  <div class="message-peer--id">\n'
-                                                                    '    <a href="2/messages0.html">Тест Тестов</a>\n  </div>\n</div></div>\n</div>'))
+                                                                    '    <a href="2/messages0.html">Тест Тестов</a>\n  </div>\n</div></div>\n</div>'
+                                                                    '<div class="item">\n  <div class=\'item__main\'>'
+                                                                    '<div class="message-peer">\n  <div class="message-peer--id">\n'
+                                                                    '    <a href="2000000001/messages0.html">Беседа</a>\n  </div>\n</div></div>\n</div>'))
     write(root, 'wall/wall0.html', page(1, 'Стена', ''.join(
         '<div class="item">\n  <div class=\'item__main\'><div class="post">\n'
         '  <a class="post__link fl_l" href="https://vk.ru/wall1_%d">Запись</a>\n'
@@ -104,6 +108,8 @@ def make_archive(root):
                   '<a class="pg_lnk fl_l" href="messages50.html"><div class="pg_in">2</div></a>\n  </div>\n</div>')
     for name, msgs in pages.items():
         write(root, 'messages/2/' + name, page(2, 'Тест Тестов', ''.join(msgs) + pagination))
+    write(root, 'messages/2000000001/messages0.html', page(2, 'Беседа', message(11, 2, 5, 3, 12, 'Мем', 'https://sun9-1.userapi.com/y.jpg')
+                                                           + message(10, 1, 5, 3, 11, 'Привет, беседа')))
 
 
 def make_bare_archive(root):
@@ -121,7 +127,9 @@ script = sys.argv.pop(1)
 sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
 import vk_archive_enrich as m
 
-ME = m.Archive(sys.argv[1]).self_id or 1
+ARCHIVE = m.Archive(sys.argv[1])
+ME = ARCHIVE.self_id or 1
+LTS = {mid: lts for p in ARCHIVE.peers() for mid, lts, *_ in ARCHIVE.scan_peer(p).msgs}
 
 
 class Response:
@@ -134,10 +142,10 @@ class Session:
 
 
 class StubVK:
-    def __init__(self, cookies, token=None):
+    def __init__(self, cookies, token=None, reload=None):
         self.http = Session()
 
-    def refresh(self):
+    def refresh(self, patient=True):
         pass
 
     def call(self, method, **params):
@@ -148,21 +156,88 @@ class StubVK:
             return []
         return {'items': [], 'count': 0}
 
-    def execute(self, calls):
-        return [None] * len(calls)
+    def execute(self, calls):  # every message comes with a photo, owner 7 and id = the message id
+        return [{'items': [{'id': int(i), 'date': LTS.get(int(i), 0) - 3 * 3600, 'from_id': ME, 'attachments': [
+            {'type': 'photo', 'photo': {'id': int(i), 'owner_id': 7, 'sizes': [
+                {'url': 'https://example.invalid/%s.jpg' % i, 'width': 1, 'height': 1}]}}]}
+            for i in p['message_ids'].split(',')]} if method == 'messages.getById' else None for method, p in calls]
 
 
 def broken(*args, **kwargs):
     raise RuntimeError('broken on purpose by the test')
 
 
+def download(self, rel, url, method, limit, keys):  # no network: an empty file stands in for each download
+    os.makedirs(os.path.dirname(os.path.join(self.dst, rel)), exist_ok=True)
+    open(os.path.join(self.dst, rel), 'wb').close()
+    self._record(keys, rel, None)
+
+
 m.VKApi = StubVK
+m.Media._one = download
 m.load_cookies = lambda browser, path: ([('.vk.ru', 'remixsid', 'test', '/')], 'the test')
 for name in filter(None, os.environ.get('VKAE_TEST_BREAK', '').split(',')):  # parts that must fail without stopping the run
     setattr(m.Enricher, name, broken)
 m.main()
 '''
 NO_MEDIA = 'photos,videos,covers,voice,music,docs,stickers,gifts,avatars'
+
+# The VK client's patience, with the clock and the network replaced: the token refresh fails until the
+# cookies are read again, the connection drops once, VK asks for a captcha once.
+RESILIENCE = r'''
+import os, sys, time
+script = sys.argv.pop(1)
+sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+import requests
+import vk_archive_enrich as m
+
+time.sleep = lambda s: None
+ups = iter([False, False, True])  # the line is down for a while, then back
+m.Net.up = staticmethod(lambda: next(ups, True))
+
+
+class Reply:
+    def __init__(self, j):
+        self.j = j
+
+    def json(self):
+        return self.j
+
+
+class Http:
+    def __init__(self):
+        self.cookies = requests.cookies.RequestsCookieJar()
+        self.api = 0
+
+    def post(self, url, data=None, **kw):
+        if 'web_token' in url:
+            if self.cookies.get('remixsid') != 'new':
+                return Reply({'type': 'error'})
+            return Reply({'type': 'okay', 'data': {'access_token': 'T', 'expires': time.time() + 3600, 'user_id': 1}})
+        self.api += 1
+        if self.api == 1:
+            raise requests.ConnectionError('the line dropped')
+        if self.api == 2:
+            return Reply({'error': {'error_code': 14, 'error_msg': 'Captcha needed'}})
+        return Reply({'response': [{'id': 1}]})
+
+
+reloads = []
+api = m.VKApi([('.vk.ru', 'remixsid', 'old', '/')], reload=lambda: reloads.append(1) or [('.vk.ru', 'remixsid', 'new', '/')])
+api.http = Http()
+api.use_cookies([('.vk.ru', 'remixsid', 'old', '/')])
+assert api.call('users.get') == [{'id': 1}]
+assert reloads and api.token == 'T'
+api.reload = None
+api.expires = 0
+api.use_cookies([('.vk.ru', 'remixsid', 'old', '/')])
+try:
+    api.call('users.get')
+    sys.exit('refresh did not give up')
+except SystemExit as e:
+    assert e.code != 2 and 'session may have expired' in str(e.code), e.code
+print('RESILIENCE OK')
+'''
 
 
 def run(cmd, *args, **env):
@@ -195,7 +270,8 @@ def main():
         ok = [check(code == 0, 'exit code 0')]
         index, conv, lst = read('index.html'), read('messages/2/messages0.html'), read('messages/index-messages.html')
         ok.append(check('<meta charset="utf-8">' in index and 'enrich.js' in index, 'pages converted to utf-8 with our css/js'))
-        ok.append(check('ex-count">1<' in index and 'ex-zero' in index, 'menu shows counts, empty section dimmed'))
+        ok.append(check(re.search(r'index-messages\.html.*?ex-count">2<', index, re.S) and 'ex-zero' in index,
+                        'menu shows counts, empty section dimmed'))
         ok.append(check('data-t="' in conv and 'class="ex-day"' in conv and 'ex-pager' in conv, 'messages: dates, day separators, pager'))
         ok.append(check('data-mine="2"' in lst and 'data-count="4"' in lst, 'conversation list with message counts'))
         ok.append(check('window.EXNAV' in read('messages/2/nav.js'), 'navigation data'))
@@ -226,6 +302,8 @@ def main():
                         'no page size: the archive\'s pages again'))
         code, out = run(cmd, src, dst, '--offline', '--messages-per-page', '-5')
         ok.append(check(code == 2, 'a negative page size is refused'))
+        code, out = run(cmd, os.path.join(tmp, 'no such folder'), '--offline')
+        ok.append(check(code == 2, 'not an archive: exit code 2 (the window does not restart)'))
         if script:
             stub = [sys.executable, '-c', STUB_VK, script]
             dst = os.path.join(tmp, 'stub_enriched')
@@ -233,6 +311,18 @@ def main():
             ok.append(check(code == 0 and 'Traceback' not in out, 'online run (stub VK) on an archive without comments, photos, likes'))
             ok.append(check('Привет, как дела?' in read('messages/2/messages50.html') and 'enrich.js' in read('wall/wall0.html'),
                             'online run (stub VK) rendered the pages'))
+            dst = os.path.join(tmp, 'chats_enriched')
+            photos_only = NO_MEDIA.replace('photos,', '')
+            index = lambda: json.load(open(os.path.join(dst, '_data', 'media_index.json'), encoding='utf-8'))
+            code, out = run(stub, src, dst, '--no-media', photos_only, '--no-chat-media', 'all')
+            ok.append(check(code == 0 and 'photo:7_3' in index() and 'photo:7_11' not in index(),
+                            '--no-chat-media all: photos from the personal conversation only'))
+            code, out = run(stub, src, dst, '--no-media', photos_only)
+            ok.append(check(code == 0 and 'photo:7_11' in index() and 'saved by the last run' in out,
+                            'a rerun soon after reuses the fetched messages and gets the group chat photos'))
+            code, out = run([sys.executable, '-c', RESILIENCE, script])
+            ok.append(check(code == 0 and 'RESILIENCE OK' in out and 'Got a new VK token' in out and 'Connection is back' in out
+                            and 'captcha' in out, 'session lost, connection dropped, captcha: the VK client waits and goes on'))
             dst = os.path.join(tmp, 'broken_enriched')
             code, out = run(stub, src, dst, '--no-media', NO_MEDIA, VKAE_TEST_BREAK='do_wall,tx_wall')
             ok.append(check(code == 3 and 'ERROR in wall' in out and 'ERROR in page wall/wall0.html' in out

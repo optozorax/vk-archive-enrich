@@ -19,6 +19,7 @@ import base64
 import getpass
 import calendar
 import concurrent.futures as cf
+import contextlib
 import glob
 import hashlib
 import html
@@ -43,9 +44,10 @@ try:
 except ImportError:
     sys.exit('This script needs the "requests" package: pip install requests')
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 REPO = 'https://github.com/optozorax/vk-archive-enrich'
 API_VERSION = '5.199'
+REFETCH_AFTER = 12 * 3600  # a rerun sooner than this reuses the conversations it already fetched
 WEB_APP_ID = '6287487'  # app id of the vk.ru web client; its token can read messages
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0'
 VK = 'https://vk.ru'
@@ -71,6 +73,49 @@ FFMPEG = find_ffmpeg()
 
 def log(*a):
     print(time.strftime('%H:%M:%S'), *a, flush=True)
+
+
+def give_up(msg):
+    """Stop on a problem only the user can fix (wrong folder, not logged in). Exit code 2 tells the
+    window not to restart; other failures (code 1) are worth another try."""
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(2)
+
+
+class Net:
+    """Tells a dropped connection from a failing server: while vk.ru itself does not answer,
+    requests wait for the connection to come back instead of failing one after another."""
+    lock = threading.Lock()
+    back_at = 0.0
+    PATIENCE = 6 * 3600
+
+    @staticmethod
+    def up():
+        try:
+            requests.head(VK, headers={'User-Agent': UA}, timeout=15)  # any answer means the line works
+            return True
+        except requests.RequestException:
+            return False
+
+    @classmethod
+    def wait(cls):
+        """After a failed request: True if the connection was down (and is back now), False if it
+        works and the failure was the server's. Threads queue here while one of them waits."""
+        asked = time.time()
+        with cls.lock:
+            if cls.back_at >= asked:  # another thread has just waited the outage out
+                return True
+            if cls.up():
+                return False
+            log('No connection to vk.ru; waiting for it to come back (nothing is lost)')
+            while time.time() - asked < cls.PATIENCE:
+                time.sleep(30)
+                if cls.up():
+                    log('Connection is back after %s' % fmt_dur(time.time() - asked))
+                    cls.back_at = time.time()
+                    return True
+            log('Still no connection after %s' % fmt_dur(cls.PATIENCE))
+            return False
 
 
 def chunks(seq, n):
@@ -266,7 +311,7 @@ def load_cookies(browser=None, cookies_file=None):
     errors = []
     for b in candidates:
         if b not in CHROMIUM_BROWSERS:
-            raise SystemExit('Unknown browser "%s". Supported: firefox, %s' % (b, ', '.join(CHROMIUM_BROWSERS)))
+            give_up('Unknown browser "%s". Supported: firefox, %s' % (b, ', '.join(CHROMIUM_BROWSERS)))
         try:
             rows = cookies_via_ytdlp(b, profile)
         except Exception as e:  # browser not installed, cannot decrypt, ...
@@ -308,25 +353,28 @@ def ask_token(expired=False):
         print('@@VKAE_ASK_TOKEN %s@@' % ('expired' if expired else 'new'), flush=True)
         token = sys.stdin.readline().strip()
         if not token:
-            sys.exit('No token given.')
+            give_up('No token given.')
         return token
     if not sys.stdin.isatty():
-        sys.exit('The VK token %s and there is no terminal to ask for a new one.' % ('expired' if expired else 'is missing'))
+        give_up('The VK token %s and there is no terminal to ask for a new one.' % ('expired' if expired else 'is missing'))
     print('\n%s Open vk.ru in your browser, press F12 -> Console, paste this line and press Enter:\n\n    %s\n\n'
           'then copy the token from the window that appears.' % (
               'The token has expired (they live about an hour).' if expired else 'A VK access token is needed.', TOKEN_SNIPPET))
     token = getpass.getpass('access_token (input is hidden): ').strip()
     if not token:
-        sys.exit('No token given.')
+        give_up('No token given.')
     return token
 
 
 class VKApi:
-    def __init__(self, cookies, token=None):
+    REFRESH_WAITS = (15, 30, 60, 120, 300, 300, 600, 600, 600, 600)  # about an hour in all
+    CAPTCHA_WAITS = (300, 600, 900)
+
+    def __init__(self, cookies, token=None, reload=None):
         self.http = requests.Session()
         self.http.headers['User-Agent'] = UA
-        for host, name, value, path in cookies:
-            self.http.cookies.set(name, value, domain=host, path=path or '/')
+        self.use_cookies(cookies)
+        self.reload = reload  # () -> the cookies read again from the browser / file, or None
         self.can_refresh = bool(cookies)
         self.token = token
         self.expires = float('inf') if token else 0
@@ -335,7 +383,12 @@ class VKApi:
         self.next_slot = 0.0
         self.calls = 0
 
-    def refresh(self):
+    def use_cookies(self, cookies):
+        self.http.cookies.clear()
+        for host, name, value, path in cookies:
+            self.http.cookies.set(name, value, domain=host, path=path or '/')
+
+    def new_token(self):
         for dom in ('vk.ru', 'vk.com'):
             try:
                 r = self.http.post('https://login.%s/?act=web_token' % dom,
@@ -348,9 +401,30 @@ class VKApi:
             if j.get('type') == 'okay':
                 d = j['data']
                 self.token, self.expires, self.user_id = d['access_token'], d['expires'], d['user_id']
+                return True
+        return False
+
+    def refresh(self, patient=True):
+        """A new token from the browser session (they live about an hour). If that fails - a network
+        blip, or the browser has replaced its cookies meanwhile - read the cookies again and keep
+        trying for about an hour, so a night run does not stop at the first hiccup."""
+        waits = self.REFRESH_WAITS if patient else self.REFRESH_WAITS[:2]
+        for k, wait in enumerate(waits + (None,)):
+            if self.new_token():
+                if k:
+                    log('Got a new VK token, going on')
                 return
+            if wait is None:
+                break
+            if k == 0:
+                log('Could not get a new VK token; trying again for a while (the vk.ru session in the browser may have changed)')
+            Net.wait()
+            time.sleep(wait)
+            cookies = self.reload() if self.reload else None
+            if cookies:
+                self.use_cookies(cookies)
         sys.exit('Could not get a VK token from the browser cookies (the session may have expired). '
-                 'Open vk.ru in the browser, make sure you are logged in, and rerun - or use --token ask.')
+                 'Open vk.ru in the browser, make sure you are logged in, and run again - or use --token ask.')
 
     def _throttle(self):
         with self.lock:  # VK allows 3 requests per second for user tokens
@@ -360,8 +434,8 @@ class VKApi:
             self.next_slot = max(now, self.next_slot) + 0.35
 
     def call(self, method, **params):
-        last = None
-        for attempt in range(8):
+        last, tries, captchas = None, 0, 0
+        while tries < 8:
             if self.can_refresh and time.time() > self.expires - 90:
                 self.refresh()
             self._throttle()
@@ -371,26 +445,34 @@ class VKApi:
                 j = self.http.post('https://api.vk.ru/method/' + method, data=data, timeout=90).json()
             except (requests.RequestException, ValueError) as e:
                 last = e
-                time.sleep(2 * (attempt + 1))
+                if not (isinstance(e, requests.RequestException) and Net.wait()):  # waiting out an outage uses no try
+                    tries += 1
+                    time.sleep(2 * tries)
                 continue
             self.calls += 1
             if 'error' not in j:
                 return j['response']
             code, msg = j['error'].get('error_code'), j['error'].get('error_msg', '')
             last = VKError(code, msg)
+            if code == 14 and captchas < len(self.CAPTCHA_WAITS):  # too many requests: a pause usually lifts it
+                log('VK asked for a captcha; pausing for %d minutes' % (self.CAPTCHA_WAITS[captchas] // 60))
+                time.sleep(self.CAPTCHA_WAITS[captchas])
+                captchas += 1
+                continue
+            if code == 14:
+                sys.exit('VK keeps asking for a captcha. Open vk.ru in the browser, browse a bit, wait '
+                         'an hour and run again (finished work is kept).')
+            tries += 1
             if code == 5 and self.can_refresh:
                 self.expires = 0
                 continue
-            if code == 5 and attempt < 7:  # a pasted token expired: ask for a fresh one
+            if code == 5 and tries < 8:  # a pasted token expired: ask for a fresh one
                 with self.lock:
                     self.token = ask_token(expired=True)
                 continue
             if code in (6, 9, 10, 29):  # rate limits / temporary internal errors
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.5 * tries)
                 continue
-            if code == 14:
-                sys.exit('VK asked for a captcha. Open vk.ru in the browser, browse a bit, wait '
-                         'a few minutes and rerun (finished work is kept).')
             raise last
         raise VKError(-1, '%s: giving up after retries (%s)' % (method, last))
 
@@ -523,7 +605,7 @@ class Archive:
     def __init__(self, src):
         self.src = os.path.abspath(src)
         if not os.path.exists(os.path.join(self.src, 'index.html')):
-            sys.exit('%s does not look like a VK archive (no index.html)' % self.src)
+            give_up('%s does not look like a VK archive (no index.html)' % self.src)
         self.self_id = self._self_id()
         self.convs = {}  # peer -> Conv
         self.header_ids = set()  # authors linked from message headers
@@ -666,6 +748,7 @@ class Media:
         self.futs, self.slow_futs = set(), set()
         self.slow_workers = slow_workers
         self.disabled = {prefix for kind in disabled for prefix in MEDIA_KINDS[kind]}
+        self.skip = set()  # also off for the conversation being fetched (see skipping)
         self.segments = segments
         self.queued = self.finished = self.succeeded = 0
         self.last_log = 0.0
@@ -679,9 +762,21 @@ class Media:
         rel = self.index.get(key)
         return rel if rel in self.have else None
 
+    def off(self, prefix):
+        return prefix in self.disabled or prefix in self.skip
+
+    @contextlib.contextmanager
+    def skipping(self, kinds):
+        """Don't queue these kinds (MEDIA_KINDS names) inside the block: group chats can be told apart."""
+        self.skip = {prefix for kind in kinds for prefix in MEDIA_KINDS[kind]}
+        try:
+            yield
+        finally:
+            self.skip = set()
+
     def want(self, key, url, rel, method='http', limit=None):
         """Schedule a download unless we already have it. Use path() when rendering."""
-        if not url or key.split(':')[0] in self.disabled:
+        if not url or self.off(key.split(':')[0]):
             return
         have = self.index.get(key)
         if have in self.have:
@@ -694,6 +789,10 @@ class Media:
                 self.pending[rel][3].append(key)
             return
         self.pending[rel] = [url, method, limit, [key]]
+
+    def use_cookies(self, cookies):  # the browser replaced its cookies: new sessions from now on
+        self.cookies = cookies
+        self.local = threading.local()
 
     def _session(self):
         s = getattr(self.local, 's', None)
@@ -863,9 +962,12 @@ class Media:
             elif method.startswith('ytdlp'):
                 err = self._ytdlp(url, tmp, int(method.split(':')[1]))
             else:
-                for u in (url if isinstance(url, (list, tuple)) else [url]):  # fallbacks in order
-                    err = self._http(u, tmp, self.max_bytes if limit is None else limit)
-                    if err is None:
+                for _ in range(3):  # the connection dropped: wait for it and try the file again
+                    for u in (url if isinstance(url, (list, tuple)) else [url]):  # fallbacks in order
+                        err = self._http(u, tmp, self.max_bytes if limit is None else limit)
+                        if err is None:
+                            break
+                    if err is None or re.match(r'HTTP 4|skipped|got an html|VK: ', err) or not Net.wait():
                         break
         except Exception as e:  # never let one file kill the run
             err = '%s: %s' % (type(e).__name__, e)
@@ -1030,7 +1132,7 @@ class Want:
         thumb = pick_image(v.get('image')) or pick_image(v.get('first_frame'))
         if thumb:
             self.m.want('vthumb:' + key, thumb, 'media/video_thumbs/%s.jpg' % key)
-        if not full or 'video' in self.m.disabled:
+        if not full or self.m.off('video'):
             return
         files = v.get('files') or {}
         if not files and self.api and key not in self.resolved and v.get('id'):
@@ -1691,7 +1793,7 @@ class Enricher:
         self.src = Archive(args.src)
         self.dst = os.path.abspath(args.dst or self.src.src.rstrip('/\\') + '_enriched')
         if os.path.abspath(self.dst) == self.src.src:
-            sys.exit('Destination must differ from the source archive')
+            give_up('Destination must differ from the source archive')
         os.makedirs(os.path.join(self.dst, '_data'), exist_ok=True)
         self.data = lambda *p: os.path.join(self.dst, '_data', *p)
         self.self_id = self.src.self_id or load_json(self.data('meta.json'), {}).get('self_id')
@@ -1745,14 +1847,14 @@ class Enricher:
         if self.cookies:
             log('Using the vk.ru session from', where)
         elif not self.a.token:
-            sys.exit('No logged-in vk.ru session found in %s. Log in to vk.ru there, or use --browser NAME, '
-                     '--cookies cookies.txt or --token ask (see README).' % where)
-        self.api = VKApi(self.cookies, self.a.token)
+            give_up('No logged-in vk.ru session found in %s. Log in to vk.ru there, or use --browser NAME, '
+                    '--cookies cookies.txt or --token ask (see README).' % where)
+        self.api = VKApi(self.cookies, self.a.token, self.reload_cookies)
         if not self.a.token:
-            self.api.refresh()
+            self.api.refresh(patient=False)
         me = self.api.call('users.get')[0]
         if self.self_id and me['id'] != self.self_id:
-            sys.exit('The browser is logged in as id%d but the archive belongs to id%d.' % (me['id'], self.self_id))
+            give_up('The browser is logged in as id%d but the archive belongs to id%d.' % (me['id'], self.self_id))
         self.self_id = me['id']
         log('Logged in as id%d' % me['id'])
         ytc = None
@@ -1762,6 +1864,18 @@ class Enricher:
         self.media = Media(self.dst, self.cookies, self.a.workers, self.a.max_file_mb, self.a.max_video_mb, ytc,
                            self.a.video_workers, self.a.segments, disabled)
         self.want = Want(self.media, self.a, self.api)
+
+    def reload_cookies(self):
+        """The browser's cookies as they are now (it replaces them from time to time), for the API and the downloads."""
+        try:
+            cookies, _ = load_cookies(self.a.browser, self.a.cookies)
+        except (Exception, SystemExit):
+            return None
+        if cookies and getattr(self, 'media', None):
+            self.media.use_cookies(cookies)
+            if self.media.ytdlp_cookies:
+                write_netscape_cookies(cookies, self.media.ytdlp_cookies)
+        return cookies
 
     def flush(self, label):
         if self.api:
@@ -1803,28 +1917,44 @@ class Enricher:
         path = self.data('messages', '%d.json' % peer)
         conv = self.src.convs[peer]
         ids = [m[0] for m in conv.msgs if m[4] or self.a.all_messages]
-        got = {}
-        for group in chunks(list(chunks(ids, 100)), 10):
-            res = self.api.execute([('messages.getById', {'message_ids': ','.join(map(str, c))}) for c in group])
-            for r in res:
-                for m in (r or {}).get('items', []):
-                    got[m['id']] = m
-        save_json(path, {'peer': peer, 'fetched': int(time.time()), 'requested': len(ids), 'items': got})
+        saved = self.recent_fetch(path)
+        if saved.get('requested') == len(ids):  # a restart: what the last run got is still fresh
+            got, source = {int(k): v for k, v in saved.get('items', {}).items()}, 'saved by the last run'
+        else:
+            got, source = {}, 'from API'
+            for group in chunks(list(chunks(ids, 100)), 10):
+                res = self.api.execute([('messages.getById', {'message_ids': ','.join(map(str, c))}) for c in group])
+                for r in res:
+                    for m in (r or {}).get('items', []):
+                        got[m['id']] = m
+            save_json(path, {'peer': peer, 'fetched': int(time.time()), 'requested': len(ids), 'items': got})
+            self.stats['messages requested'] += len(ids)
+            self.stats['messages returned by API'] += len(got)
         self.msgs[peer] = got
-        self.stats['messages requested'] += len(ids)
-        self.stats['messages returned by API'] += len(got)
         for mid, lts, *_ in conv.msgs:  # learn the archive's timezone
             if lts and mid in got and sum(self.tz_votes.values()) < 20000:
                 self.tz_votes[round((lts - got[mid]['date']) / 900) * 900] += 1
-        for m in got.values():
-            for a in iter_atts(m):
-                self.want.attachment(a)
-        missing = {m[0] for m in conv.msgs if m[4] and m[0] not in got}
-        if missing:
-            self.want_archive_fallback(peer, missing)
-        log('[%d/%d] peer %d: %d/%d messages from API, %d new files queued' % (
-            n, total, peer, len(got), len(ids), len(self.media.pending)))
-        self.flush('peer %d' % peer)
+        with self.media.skipping(self.a.no_chat_media if not 0 < peer < 2000000000 else ()):
+            for m in got.values():
+                for a in iter_atts(m):
+                    self.want.attachment(a)
+            missing = {m[0] for m in conv.msgs if m[4] and m[0] not in got}
+            if missing:
+                self.want_archive_fallback(peer, missing)
+            log('[%d/%d] peer %d: %d/%d messages %s, %d new files queued' % (
+                n, total, peer, len(got), len(ids), source, len(self.media.pending)))
+            self.flush('peer %d' % peer)
+
+    def recent_fetch(self, path):
+        """A conversation's saved API answers if they are recent enough to reuse (a restart soon after
+        a stop need not ask VK for everything again; file links stay valid for longer than this)."""
+        try:
+            if time.time() - os.path.getmtime(path) > REFETCH_AFTER:
+                return {}
+        except OSError:
+            return {}
+        saved = load_json(path, {})
+        return saved if 0 <= time.time() - saved.get('fetched', 0) <= REFETCH_AFTER else {}
 
     def want_archive_fallback(self, peer, missing):
         """Messages VK no longer returns: grab photos / voice links the archive itself has."""
@@ -3073,7 +3203,7 @@ def parse_list(value, allowed, what):
     items = [x.strip().lower() for x in (value or '').split(',') if x.strip()]
     bad = [x for x in items if x not in allowed]
     if bad:
-        sys.exit('Unknown %s: %s. Allowed: %s' % (what, ', '.join(bad), ', '.join(allowed)))
+        give_up('Unknown %s: %s. Allowed: %s' % (what, ', '.join(bad), ', '.join(allowed)))
     return items
 
 
@@ -3089,6 +3219,7 @@ def main():
                '  python3 vk_archive_enrich.py Archive                         # всё, кроме лайков\n'
                '  python3 vk_archive_enrich.py Archive --likes --github-activity\n'
                '  python3 vk_archive_enrich.py Archive --only messages --no-media videos,music\n'
+               '  python3 vk_archive_enrich.py Archive --no-chat-media all     # беседы без файлов, личные со всеми\n'
                '  python3 vk_archive_enrich.py Archive --browser chrome\n'
                '  python3 vk_archive_enrich.py Archive --offline              # пересобрать страницы без интернета\n'
                '  python3 vk_archive_enrich.py Archive --offline --messages-per-page 500\n')
@@ -3109,6 +3240,9 @@ def main():
     g.add_argument('--likes', action='store_true', help='добавить раздел likes: то, что вы лайкали (по умолчанию выключен, это гигабайты)')
     g.add_argument('--no-media', metavar='TYPES', default='',
                    help='не скачивать эти типы файлов: %s' % ', '.join(MEDIA_KINDS))
+    g.add_argument('--no-chat-media', metavar='TYPES', default='',
+                   help='не скачивать эти типы файлов из бесед и переписок с сообществами: all (никакие) '
+                        'или типы, как в --no-media. Личные переписки скачиваются как обычно')
     g.add_argument('--external-videos', action='store_true', help='качать и видео с YouTube и т.п. (через yt-dlp)')
     g.add_argument('--max-video-height', type=int, default=1080, help='максимальное качество видео (по умолчанию 1080)')
     g.add_argument('--max-file-mb', type=int, default=0, help='не качать файлы больше N МБ (0 = без ограничения)')
@@ -3155,6 +3289,9 @@ def main():
     sections -= set(parse_list(args.skip, SECTIONS, 'section'))
     args.sections = sections
     args.no_media = parse_list(args.no_media, list(MEDIA_KINDS), 'media type')
+    args.no_chat_media = parse_list(args.no_chat_media, list(MEDIA_KINDS) + ['all'], 'media type')
+    if 'all' in args.no_chat_media:
+        args.no_chat_media = list(MEDIA_KINDS)
     if not FFMPEG and 'music' not in args.no_media:
         log('note: ffmpeg not found - music tracks will not be downloaded')
         args.no_media.append('music')

@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -27,6 +28,9 @@ MEDIA = [('photos', 'Фото'), ('videos', 'Видео'), ('covers', 'Обло�
          ('music', 'Музыка'), ('docs', 'Документы'), ('stickers', 'Стикеры'), ('gifts', 'Подарки'),
          ('avatars', 'Аватарки')]
 QUALITY = ['360', '480', '720', '1080', '1440', '2160']
+CHAT_MEDIA = [('все отмеченные', ''), ('без видео', 'videos'), ('никакие', 'all')]  # files from group chats and communities
+RESTART_DELAYS = [60, 300, 600, 1200]  # seconds before a restart, after 1, 2, 3, 4 failures in a row soon after starting
+QUICK_FAIL = 300  # a run that stops sooner than this counts as such a failure
 AS_ARCHIVE, ALL_ON_ONE = 'как в архиве', 'все на одной'
 PER_PAGE = [AS_ARCHIVE, '20', '50', '100', '200', '500', '1000', '5000', ALL_ON_ONE]
 SEARCH_RESULTS = ['50', '100', '200', '500', '1000', 'все сразу']
@@ -122,6 +126,12 @@ class App:
         self.token = tk.StringVar()
         self.sections = {k: tk.BooleanVar(value=(k != 'likes')) for k, _ in SECTIONS}
         self.media = {k: tk.BooleanVar(value=True) for k, _ in MEDIA}
+        self.chat_media = tk.StringVar(value=CHAT_MEDIA[0][0])
+        self.autorestart = tk.BooleanVar(value=True)
+        self.restart_job = None
+        self.stopping = False
+        self.started_at = 0.0
+        self.quick_fails = self.restarts = 0
         self.activity = tk.BooleanVar(value=True)
         self.quality = tk.StringVar(value='1080')
         self.offline = tk.BooleanVar(value=False)
@@ -179,6 +189,11 @@ class App:
         box.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
         for i, (k, label) in enumerate(MEDIA):
             ttk.Checkbutton(box, text=label, variable=self.media[k]).grid(row=i // 3, column=i % 3, sticky='w', padx=(0, 12))
+        line = ttk.Frame(box)
+        line.grid(row=3, column=0, columnspan=3, sticky='w', pady=(6, 0))
+        ttk.Label(line, text='Из бесед и сообществ:').pack(side='left')
+        ttk.Combobox(line, textvariable=self.chat_media, values=[label for label, _ in CHAT_MEDIA], width=15,
+                     state='readonly').pack(side='left', padx=(6, 0))
 
         box = ttk.LabelFrame(outer, text='Дополнительно', padding=10)
         box.grid(row=3, column=0, sticky='ew', pady=(10, 0))
@@ -186,6 +201,8 @@ class App:
         ttk.Label(box, text='Видео не выше:').grid(row=0, column=1, sticky='e', padx=(24, 4))
         ttk.Combobox(box, textvariable=self.quality, values=QUALITY, width=6, state='readonly').grid(row=0, column=2, sticky='w')
         ttk.Checkbutton(box, text='Только пересобрать страницы', variable=self.offline).grid(row=0, column=3, sticky='w', padx=(24, 0))
+        ttk.Checkbutton(box, text='Запускать заново, если работа прервётся (пропал вход во ВК или интернет)',
+                        variable=self.autorestart).grid(row=1, column=0, columnspan=4, sticky='w', pady=(4, 0))
 
         box = ttk.LabelFrame(outer, text='Страницы', padding=10)
         box.grid(row=4, column=0, sticky='ew', pady=(10, 0))
@@ -260,7 +277,9 @@ class App:
         for name in ('src', 'dst', 'login', 'cookies', 'quality', 'msgs_per_page', 'items_per_page', 'search_results'):
             if isinstance(s.get(name), str):
                 getattr(self, name).set(s[name])
-        for name in ('activity', 'offline'):
+        if s.get('chat_media') in [label for label, _ in CHAT_MEDIA]:
+            self.chat_media.set(s['chat_media'])
+        for name in ('activity', 'offline', 'autorestart'):
             if isinstance(s.get(name), bool):
                 getattr(self, name).set(s[name])
         for k, v in (s.get('sections') or {}).items():
@@ -273,7 +292,8 @@ class App:
 
     def save_settings(self):  # the token is deliberately not saved
         s = {name: getattr(self, name).get() for name in ('src', 'dst', 'login', 'cookies', 'quality', 'activity', 'offline',
-                                                          'msgs_per_page', 'items_per_page', 'search_results')}
+                                                          'msgs_per_page', 'items_per_page', 'search_results',
+                                                          'chat_media', 'autorestart')}
         s['sections'] = {k: v.get() for k, v in self.sections.items()}
         s['media'] = {k: v.get() for k, v in self.media.items()}
         try:
@@ -309,6 +329,9 @@ class App:
         off = [k for k, _ in MEDIA if not self.media[k].get()]
         if off:
             args += ['--no-media', ','.join(off)]
+        chat_off = dict(CHAT_MEDIA).get(self.chat_media.get())
+        if chat_off:
+            args += ['--no-chat-media', chat_off]
         if self.activity.get():
             args.append('--github-activity')
         args += ['--max-video-height', self.quality.get()]
@@ -323,14 +346,21 @@ class App:
                 args += [option, value]
         return worker_command() + args
 
-    def start(self):
+    def start(self, auto=False):
+        auto = auto or self.restart_job is not None  # "Начать" while waiting to restart: restart now
+        self.cancel_restart()
         if self.proc:
             return
         cmd = self.command()
         if not cmd:
             return
         self.save_settings()
-        self.clear_log()
+        if auto:
+            self.restarts += 1
+            self.append('\n—— Перезапуск %d ——\n' % self.restarts)
+        else:
+            self.quick_fails = self.restarts = 0
+            self.clear_log()
         self.append('Запуск: %s\n' % ' '.join(cmd[len(worker_command()):]))
         env = dict(os.environ, VK_ARCHIVE_ENRICH_GUI='1', PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
         try:
@@ -341,6 +371,8 @@ class App:
             self.proc = None
             return
         threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
+        self.stopping = False
+        self.started_at = time.time()
         self.btn_start.configure(state='disabled')
         self.btn_stop.configure(state='normal')
         self.progress.configure(mode='indeterminate')
@@ -353,8 +385,14 @@ class App:
         self.lines.put(None)
 
     def stop(self):
+        if self.restart_job:  # waiting to restart: don't
+            self.cancel_restart()
+            self.btn_stop.configure(state='disabled')
+            self.status.set('Перезапуск отменён. Нажмите «Начать», чтобы продолжить.')
+            return
         if not self.proc:
             return
+        self.stopping = True
         self.status.set('Останавливаю…')
         if os.name == 'nt':  # the worker may have ffmpeg children: end the whole tree
             subprocess.run(['taskkill', '/PID', str(self.proc.pid), '/T', '/F'], capture_output=True, creationflags=core.NO_WINDOW)
@@ -428,9 +466,45 @@ class App:
             self.determinate(100)
             self.status.set('Готово, но с ошибками (строки ERROR в журнале). Нажмите «Открыть результат».')
             self.root.bell()
+        elif code == 2:  # a problem only the user can fix
+            self.determinate(0)
+            self.status.set('Остановлено: причина в последних строках журнала. Исправьте и нажмите «Начать».')
+        elif self.autorestart.get() and not self.stopping and not self.offline.get():
+            self.plan_restart(code)
         else:
             self.determinate(0)
             self.status.set('Остановлено (код %s). Запустите снова — скачанное сохранится, работа продолжится.' % code)
+
+    def plan_restart(self, code):
+        """The run broke off (session lost, no internet for hours, a crash): start it again after a pause,
+        a longer one if it keeps failing right after the start; give up after a few such failures."""
+        quick = time.time() - self.started_at < QUICK_FAIL
+        self.quick_fails = self.quick_fails + 1 if quick else 0
+        if self.quick_fails > len(RESTART_DELAYS):
+            self.determinate(0)
+            self.status.set('Остановлено (код %s): перезапуски не помогли, причина в журнале. Нажмите «Начать», когда исправите.' % code)
+            return
+        delay = RESTART_DELAYS[max(self.quick_fails - 1, 0)]
+        self.append('Работа прервалась (код %s). Перезапуск через %d мин. — скачанное не пропадёт.\n' % (code, delay // 60))
+        self.btn_stop.configure(state='normal')
+        self.countdown(time.time() + delay, code)
+
+    def countdown(self, at, code):
+        left = int(at - time.time() + 0.5)
+        if left <= 0:
+            self.restart_job = None
+            self.start(auto=True)
+            if not self.proc:  # e.g. the archive's drive is gone
+                self.status.set('Перезапустить не получилось. Проверьте настройки и нажмите «Начать».')
+            return
+        self.status.set('Работа прервалась (код %s). Перезапуск через %d:%02d. «Стоп» — отменить, «Начать» — сейчас.' % (
+            code, left // 60, left % 60))
+        self.restart_job = self.root.after(1000, self.countdown, at, code)
+
+    def cancel_restart(self):
+        if self.restart_job:
+            self.root.after_cancel(self.restart_job)
+            self.restart_job = None
 
     def demo(self):
         """Example state for screenshots: invented paths and a log like a real run."""
@@ -498,6 +572,7 @@ class App:
     def on_close(self):
         if self.proc and not messagebox.askyesno(APP, 'Работа ещё идёт. Остановить и закрыть? Скачанное сохранится.'):
             return
+        self.cancel_restart()
         self.stop()
         self.root.destroy()
 
